@@ -164,3 +164,11 @@ cython_debug/
 
 # Data folder
 data/
+docs/
+.claude/
+.DS_Store
+
+# Large model artifacts
+models/*.pkl
+
+backup/
