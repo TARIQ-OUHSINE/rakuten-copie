@@ -677,3 +677,84 @@ Beyond embedding extraction, three more changes speed up MLP training:
   - If training ran on CPU only (GIL never released → threads can't truly parallelize Python loops)
   - If the data were small (pickling cost negligible)
   - If you needed crash isolation (a segfault in one worker doesn't kill the others)
+
+---
+
+## How `baseline_model.py` and `tfidf_translated.py` Work
+
+Both models classify Rakuten products into categories using **TF-IDF + LightGBM**, but they differ in how they handle multilingual text.
+
+### `baseline_model.py` — Naive Multilingual Approach
+
+**Pipeline:** `text_clean` → TF-IDF → LightGBM → predict
+
+1. Loads pre-cleaned data (`train_cleaned.pkl`) with a `text_clean` column
+2. Builds a **TF-IDF** vectorizer (20K features, unigrams+bigrams) directly on the raw multilingual text, using stopwords from **French + English + German** combined
+3. Trains a **LightGBM** classifier with early stopping (1000 trees max, stops after 50 rounds without improvement, balanced class weights)
+4. Evaluates with weighted F1, saves confusion matrix + per-class F1 plots
+
+**Key limitation:** The TF-IDF vocabulary is fragmented across languages — the same product concept in French vs English creates different tokens, diluting the signal.
+
+---
+
+### `tfidf_translated.py` — Translation-First Approach
+
+**Pipeline:** detect language → translate to French → normalize → TF-IDF → LightGBM → predict
+
+Adds 3 preprocessing steps before TF-IDF:
+
+1. **Language detection** — uses `langdetect` to tag each row with its language (e.g. `fr`, `en`, `de`)
+2. **Translation** — translates non-French text to French via Google Translate (`deep-translator`), supporting 9 source languages (en, de, es, it, pt, nl, ja, ko, zh-cn). Rate-limited with 50ms delays, truncates at 4500 chars
+3. **Text normalization** — lowercases, strips punctuation/digits, collapses whitespace on the translated text
+4. Builds TF-IDF on the unified French text (`text_fr_clean`) using **French-only** stopwords
+5. Same LightGBM classifier as baseline
+
+**Key advantage:** All text is in one language, so TF-IDF features are semantically unified — "shoes" and "chaussures" both become "chaussures".
+
+It also **caches** the translated data to `data/train_translated.pkl` / `test_translated.pkl` so the expensive translation step only runs once.
+
+---
+
+### Comparison
+
+| Aspect | baseline_model.py | tfidf_translated.py |
+|---|---|---|
+| Text input | raw multilingual `text_clean` | translated French `text_fr_clean` |
+| Stopwords | FR + EN + DE | FR only |
+| Extra deps | none | `langdetect`, `deep-translator` |
+| Speed | fast | slow first run (translation), fast after cache |
+| Hypothesis | multilingual TF-IDF is "good enough" | unifying language improves feature quality |
+
+---
+
+## Weighted F1 vs Macro F1
+
+### Definitions
+
+- **Macro F1** — Compute F1 for each class independently, then take the **unweighted average**. Every class counts equally regardless of size.
+  - `Macro F1 = (1/N) × Σ F1_class_i`
+
+- **Weighted F1** — Compute F1 for each class independently, then take the **weighted average** by each class's support (number of samples). Larger classes have more influence.
+  - `Weighted F1 = Σ (support_i / total_samples) × F1_class_i`
+
+### Example from This Project
+
+| Metric | Baseline | Translated |
+|--------|----------|------------|
+| Weighted F1 | 0.8184 | 0.8107 |
+| Macro F1 | 0.80 | 0.79 |
+
+The gap (Weighted > Macro) indicates that **smaller classes perform worse** than larger ones. For example:
+- Class 2583 (support=2,042, F1=0.97) pulls weighted F1 **up**
+- Class 10 (support=623, F1=0.44) pulls macro F1 **down** but has less impact on weighted F1
+
+### When to Use Which
+
+| Metric | Use when... |
+|--------|-------------|
+| **Weighted F1** | You care about overall accuracy proportional to real-world class frequency |
+| **Macro F1** | Every class matters equally, regardless of size (e.g., rare categories are just as important) |
+
+### Key Insight
+
+If Weighted F1 ≈ Macro F1, the model performs evenly across classes. If Weighted F1 >> Macro F1, the model struggles on minority classes — consider class balancing, oversampling, or per-class tuning.

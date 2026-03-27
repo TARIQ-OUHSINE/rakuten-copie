@@ -25,6 +25,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import classification_report, f1_score, confusion_matrix
 import lightgbm as lgb
+from tqdm import tqdm
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -104,8 +105,8 @@ def build_tfidf(X_train, X_val):
         stopwords.words("german")
     ))
     tfidf = TfidfVectorizer(
-        max_features=20_000,
-        ngram_range=(1, 2),
+        max_features=10_000,
+        ngram_range=(1, 1),
         sublinear_tf=True,
         stop_words=stop_words,
         min_df=2,
@@ -117,11 +118,27 @@ def build_tfidf(X_train, X_val):
 
 
 # ── LightGBM ─────────────────────────────────────────────────────────────────
+class TqdmCallback:
+    """tqdm progress bar callback for LightGBM."""
+    def __init__(self, total):
+        self.pbar = tqdm(total=total, desc="LightGBM training", unit="iter")
+        self.best_score = None
+
+    def __call__(self, env):
+        self.pbar.update(1)
+        if env.evaluation_result_list:
+            score = env.evaluation_result_list[0][2]
+            self.pbar.set_postfix(val_loss=f"{score:.4f}", iter=env.iteration)
+        if env.iteration == env.end_iteration - 1:
+            self.pbar.close()
+
+
 def train_lgbm(X_tr, X_va, y_train, y_val):
+    n_estimators = 500
     model = lgb.LGBMClassifier(
-        n_estimators=1000,
+        n_estimators=n_estimators,
         learning_rate=0.05,
-        num_leaves=127,
+        num_leaves=31,
         max_depth=-1,
         min_child_samples=20,
         class_weight="balanced",
@@ -134,7 +151,7 @@ def train_lgbm(X_tr, X_va, y_train, y_val):
         eval_set=[(X_va, y_val)],
         callbacks=[
             lgb.early_stopping(stopping_rounds=50, verbose=False),
-            lgb.log_evaluation(period=100),
+            TqdmCallback(total=n_estimators),
         ],
     )
     return model
