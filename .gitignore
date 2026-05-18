@@ -164,3 +164,11 @@ cython_debug/
 
 # Data folder
 data/
+models/
+
+# ML model binaries
+*.pkl
+*.pth
+*.h5
+*.pt
+*.bin
