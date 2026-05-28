@@ -5,8 +5,9 @@ Streamlit demo app (inference only — no retraining).
 Architecture v2 :
     Texte  : CamemBERT fine-tuné → 27 probabilités
     Image  : CLIP ViT-B/32 (laion2b) + MLP → 27 probabilités
-    Meta   : Logistic Regression stacker E1 (texte) + E2 (image)
-    Fusion : Moyenne des probabilités stackées
+    Meta   : MetaMLP stacker (meta_best.pkl) sur 61 features
+             = 27 probs texte + 27 probs image + 6 meta-scalaires + 1 accord
+    Fallback : meta_E1 (texte seul) ou meta_E2 (image seule) si une modalité manque
 
 Lancement :
     streamlit run src/streamlit/app.py
@@ -28,6 +29,53 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+
+
+# ─── MetaMLP — défini AVANT pickle.load(meta_best.pkl) ──────────────────────
+# meta_best.pkl référence __main__.MetaMLP et __main__.MetaMLPClassifier
+# (sérialisés depuis NB05). Ces classes doivent être visibles à l'unpickling.
+
+class MetaMLP(nn.Module):
+    """FC → BN → ReLU → Dropout (identique à NB05)."""
+
+    def __init__(self, in_dim: int, hidden, n_classes: int):
+        super().__init__()
+        layers: list = []
+        prev = in_dim
+        for h in hidden:
+            layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.3)]
+            prev = h
+        layers += [nn.Linear(prev, n_classes)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MetaMLPClassifier:
+    """Wrapper sklearn-like sérialisé dans meta_best.pkl (cfg + model)."""
+
+    def __init__(self, in_dim: int = 61, hidden=(256, 128, 64), n_classes: int = 27,
+                 lr: float = 1e-3, epochs: int = 100, patience: int = 20, batch: int = 256):
+        self.cfg = {
+            'in_dim': in_dim, 'hidden': hidden, 'n_classes': n_classes,
+            'lr': lr, 'epochs': epochs, 'patience': patience, 'batch': batch,
+        }
+        self.model = MetaMLP(in_dim, hidden, n_classes)
+
+    def predict_proba(self, X):
+        self.model.eval()
+        with torch.no_grad():
+            Xt = torch.tensor(np.asarray(X), dtype=torch.float32)
+            return F.softmax(self.model(Xt), dim=1).numpy()
+
+    def predict(self, X):
+        return self.predict_proba(X).argmax(axis=1)
+
+
+# Rendre les classes visibles sous __main__ pour pickle
+sys.modules['__main__'].MetaMLP = MetaMLP
+sys.modules['__main__'].MetaMLPClassifier = MetaMLPClassifier
 
 # ── Project paths ────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -282,15 +330,66 @@ def load_image_model():
     return clip, processor, head
 
 
+class _CPUUnpickler(pickle.Unpickler):
+    """Unpickler qui remappe les tenseurs CUDA → CPU à la volée.
+
+    Le pickle de meta_best.pkl (NB05) sérialise un nn.Module entraîné sur GPU.
+    Sur une machine CPU-only, le `pickle.load` standard échoue. Ce custom
+    Unpickler intercepte `torch.storage._load_from_bytes` pour forcer
+    `map_location='cpu'` (équivalent CPU de `torch.load(..., map_location='cpu')`).
+    """
+
+    def find_class(self, module, name):
+        if module == "torch.storage" and name == "_load_from_bytes":
+            return lambda b: torch.load(BytesIO(b), map_location="cpu", weights_only=False)
+        return super().find_class(module, name)
+
+
+def _load_pickle_cpu(path: Path):
+    """Charge un pickle contenant potentiellement des tenseurs CUDA, en CPU."""
+    with open(path, "rb") as f:
+        return _CPUUnpickler(f).load()
+
+
 @st.cache_resource(show_spinner="Chargement des stackers…")
 def load_stackers():
-    with open(MODEL_V2_DIR / "label_encoder.pkl", "rb") as f:
-        le = pickle.load(f)
-    with open(MODEL_V2_DIR / "meta_E1.pkl", "rb") as f:
-        meta_text = pickle.load(f)
-    with open(MODEL_V2_DIR / "meta_E2.pkl", "rb") as f:
-        meta_image = pickle.load(f)
-    return le, meta_text, meta_image
+    le = _load_pickle_cpu(MODEL_V2_DIR / "label_encoder.pkl")
+    meta_text = _load_pickle_cpu(MODEL_V2_DIR / "meta_E1.pkl")
+    meta_image = _load_pickle_cpu(MODEL_V2_DIR / "meta_E2.pkl")
+    # MetaMLP final (61 features = 27 + 27 + 3 + 3 + 1) — meilleur modèle NB05
+    meta_best_path = MODEL_V2_DIR / "meta_best.pkl"
+    meta_best = None
+    if meta_best_path.exists():
+        try:
+            meta_best = _load_pickle_cpu(meta_best_path)
+            # S'assurer que le sous-module torch est bien sur CPU
+            if hasattr(meta_best, "model") and isinstance(meta_best.model, nn.Module):
+                meta_best.model.to("cpu").eval()
+        except Exception as exc:
+            st.warning(f"meta_best.pkl introuvable ou corrompu ({exc}) — fallback moyenne E1/E2.")
+    return le, meta_text, meta_image, meta_best
+
+
+def _scalar_meta(P: np.ndarray) -> np.ndarray:
+    """entropy, margin, max_conf pour un vecteur de probas (1, n_classes) → (1, 3)."""
+    eps = 1e-12
+    entropy = -(P * np.log(P + eps)).sum(axis=1, keepdims=True)
+    sorted_p = np.sort(P, axis=1)[:, ::-1]
+    margin = (sorted_p[:, 0] - sorted_p[:, 1]).reshape(-1, 1)
+    max_conf = sorted_p[:, 0].reshape(-1, 1)
+    return np.hstack([entropy, margin, max_conf]).astype(np.float32)
+
+
+def build_meta_features(P_text: np.ndarray, P_image: np.ndarray) -> np.ndarray:
+    """Assemble les 61 meta-features pour meta_best (cf. NB05).
+
+    Entrées : P_text, P_image de shape (27,) ou (1, 27).
+    Sortie  : (1, 61) = [P_text | P_image | txt_meta(3) | img_meta(3) | accord(1)].
+    """
+    Pt = np.asarray(P_text, dtype=np.float32).reshape(1, -1)
+    Pi = np.asarray(P_image, dtype=np.float32).reshape(1, -1)
+    agreement = (Pt.argmax(1) == Pi.argmax(1)).astype(np.float32).reshape(-1, 1)
+    return np.hstack([Pt, Pi, _scalar_meta(Pt), _scalar_meta(Pi), agreement]).astype(np.float32)
 
 
 @st.cache_data(show_spinner=False)
@@ -393,7 +492,7 @@ st.markdown(
 )
 
 # Light artifacts (stackers + label encoder) load instantly
-LE, META_TEXT, META_IMAGE = load_stackers()
+LE, META_TEXT, META_IMAGE, META_BEST = load_stackers()
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🏠 Présentation",
@@ -657,8 +756,9 @@ with tab3:
 # ═════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.markdown('<div class="section-title">Tester un produit en direct</div>', unsafe_allow_html=True)
-    st.caption("CamemBERT fine-tuné pour le texte · CLIP+MLP pour l'image · "
-               "Stacker Logistic Regression par expert, fusionnés par moyenne.")
+    st.caption("CamemBERT fine-tuné (texte) · CLIP+MLP (image) · "
+               "MetaMLP `meta_best.pkl` (61 features) en fusion finale · "
+               "Fallback Meta-LR E1/E2 si une seule modalité.")
 
     samples = load_sample_designations(n=6)
     sample_labels = ["✏️ Saisie manuelle"] + [
@@ -713,12 +813,21 @@ with tab4:
                     image_stacked = META_IMAGE.predict_proba(image_probs.reshape(1, -1))[0]
                     pred_image = stack_top3(image_stacked, LE)
                 else:
+                    image_probs = None
                     image_stacked = None
                     pred_image = []
 
                 # Fusion ──────────────────────────────────────────────────
-                if text_probs is not None and image_stacked is not None:
-                    combined = (text_stacked + image_stacked) / 2.0
+                # Si les deux modalités sont disponibles ET meta_best est chargé,
+                # utiliser le MetaMLP 61-features (cf. NB05). Sinon : moyenne E1/E2.
+                fusion_label = "Fusion — Moyenne E1 + E2"
+                if text_probs is not None and image_probs is not None:
+                    if META_BEST is not None:
+                        meta_X = build_meta_features(text_probs, image_probs)
+                        combined = META_BEST.predict_proba(meta_X)[0]
+                        fusion_label = "Fusion — MetaMLP (meta_best, 61 features)"
+                    else:
+                        combined = (text_stacked + image_stacked) / 2.0
                     pred_combined = stack_top3(combined, LE)
                 else:
                     combined = None
@@ -757,7 +866,7 @@ with tab4:
                         hint="📝 Saisissez un texte pour activer ce modèle")
             render_pred(c2, "Image — CLIP+MLP + Meta-E2", pred_image,
                         hint="📷 Chargez une image pour activer ce modèle")
-            render_pred(c3, "Fusion — Stacking E1 + E2", pred_combined, primary=True,
+            render_pred(c3, fusion_label, pred_combined, primary=True,
                         hint="🔗 Texte ET image requis pour la fusion")
 
             # ── Top-3 probabilities (best available model) ──────────────
@@ -794,37 +903,45 @@ description ───►│   (HTML, lower)         │
                 └────────────┬───────────┘
                              ▼
                 ┌────────────────────────┐
-                │ CamemBERT fine-tuné    │     27 probs texte
-                │ (12 layers, 768 dim)   │─────────┐
-                └────────────────────────┘         │
+                │ CamemBERT fine-tuné    │   P_text (27)
+                │ (12 layers, 768 dim)   │────────┬────────┐
+                └────────────────────────┘        │        │
+                                                  │        ▼ (fallback texte seul)
+                                                  │   ┌──────────────────┐
+                                                  │   │  Meta-LR  E1     │
+                                                  │   │  (27 → 27)       │
+                                                  │   └──────────────────┘
+image ───► CLIP preprocess (224×224) ───┐         │
+                                        ▼         │
+                              ┌─────────────────────┐
+                              │  CLIP ViT-B/32      │  512-d  L2-normalized
+                              │  (laion2b, frozen)  │
+                              └──────────┬──────────┘
+                                         ▼
+                              ┌─────────────────────┐  P_image (27)
+                              │  MLP 512→512→256→27 │────────┬────────┐
+                              │  (BN + GELU + Drop) │        │        │
+                              └─────────────────────┘        │        ▼ (fallback image seule)
+                                                             │   ┌──────────────────┐
+                                                             │   │  Meta-LR  E2     │
+                                                             │   │  (27 → 27)       │
+                                                             │   └──────────────────┘
+                                                             │
+                       (Texte + Image disponibles)           │
+                              ┌──────────────────────────────┴──────────────┐
+                              │  build_meta_features(P_text, P_image)        │
+                              │  → 27 + 27 + 3 + 3 + 1 = 61 features          │
+                              │   [P_text | P_image | entropy/margin/maxconf  │
+                              │    × 2 | agreement]                           │
+                              └─────────────────────┬────────────────────────┘
+                                                    ▼
+                                  ┌──────────────────────────────────┐
+                                  │   MetaMLP  (meta_best.pkl)        │
+                                  │   61 → 256 → 128 → 64 → 27        │
+                                  │   FC → BN → ReLU → Dropout(0.3)   │
+                                  └────────────────┬─────────────────┘
                                                    ▼
-                                          ┌──────────────────┐
-                                          │  Meta-LR  E1     │  text_stacked (27)
-                                          │  (27 → 27)       │─────────────────┐
-                                          └──────────────────┘                 │
-image ───► CLIP preprocess (224×224) ───┐                                      │
-                                        ▼                                      │
-                              ┌─────────────────────┐                          │
-                              │  CLIP ViT-B/32      │  512-d  L2-normalized    │
-                              │  (laion2b, frozen)  │                          │
-                              └──────────┬──────────┘                          │
-                                         ▼                                     │
-                              ┌─────────────────────┐                          │
-                              │  MLP 512→512→256→27 │  27 probs image          │
-                              │  (BN + GELU + Drop) │─────────┐                │
-                              └─────────────────────┘         │                │
-                                                              ▼                │
-                                                     ┌──────────────────┐     │
-                                                     │  Meta-LR  E2     │  image_stacked (27)
-                                                     │  (27 → 27)       │─────┤
-                                                     └──────────────────┘     │
-                                                                              ▼
-                                                                       ┌─────────────┐
-                                                                       │   Average   │
-                                                                       │ (E1 + E2)/2 │
-                                                                       └──────┬──────┘
-                                                                              ▼
-                                                                      27 prdtypecode probas
+                                       27 prdtypecode probas (softmax)
         """,
         language=None,
     )
@@ -836,8 +953,8 @@ image ───► CLIP preprocess (224×224) ───┐                      
 - **CamemBERT-base** (110 M params) fine-tuné 3 epochs, batch 32, lr 2e-5
 - **CLIP ViT-B/32 (laion2B)** : backbone gelé, MLP entraîné from scratch
 - **MLP image** : 3 couches denses avec BatchNorm + GELU + Dropout 0.3
-- **Meta-stacker** : Logistic Regression `saga`, `class_weight=balanced`, C=2.0
-- **Fusion par moyenne** plutôt que stacking de niveau 2 : plus robuste avec peu de données
+- **Meta-stackers mono-modaux** (E1, E2) : Logistic Regression `saga`, `class_weight=balanced`, C=2.0 — utilisés en fallback texte-seul / image-seule
+- **Fusion finale** : **MetaMLP** `meta_best.pkl` (NB05) sur 61 features = 27 probs texte + 27 probs image + 3 méta-scalaires texte (entropie, margin, max_conf) + 3 méta-scalaires image + 1 indicateur d'accord — entraîné en OOF 5-fold pour éviter la fuite
 - **Pas de TTA / d'augmentation** : focus sur la qualité du backbone
         """)
     with col2:
@@ -845,7 +962,7 @@ image ───► CLIP preprocess (224×224) ───┐                      
         st.markdown("""
 - **CamemBERT 512 tokens max** : descriptions très longues tronquées (~3% du corpus)
 - **CLIP en zéro-shot visuel** : embeddings non spécialisés sur l'iconographie produit Rakuten
-- **Stackers par modalité indépendants** : pas de co-attention texte↔image au niveau features
+- **MetaMLP late-fusion** : pas de co-attention texte↔image au niveau features (fusion uniquement au niveau probas)
 - **Pas de calibration de température** post-hoc (Platt scaling pourrait gagner 0.5 pt)
 - **Classes 1280 / 1281** restent confondues : signal sémantique trop proche
         """)
@@ -853,10 +970,10 @@ image ───► CLIP preprocess (224×224) ───┐                      
     st.markdown('<div class="section-title">Perspectives</div>', unsafe_allow_html=True)
     persp = pd.DataFrame([
         {"Idée": "DINOv2 frozen + linear head",      "Gain attendu": "+1 à 2 pts", "Coût": "Inférence légère"},
-        {"Idée": "Fine-tuning CLIP visuel partiel",  "Gain attendu": "+2 à 4 pts", "Coût": "GPU recommandé"},
-        {"Idée": "Stacker MLP (niveau 2, 61→27)",    "Gain attendu": "+0.5 à 1 pt","Coût": "Aucun (artefact dispo)"},
+        {"Idée": "Fine-tuning CLIP visuel end-to-end","Gain attendu": "+2 à 4 pts","Coût": "GPU recommandé"},
+        {"Idée": "Test-Time Augmentation (image)",   "Gain attendu": "+0.5 à 1 pt","Coût": "Re-inférence ×N"},
+        {"Idée": "Distillation → modèle unique léger","Gain attendu": "iso F1, latence ÷ 3","Coût": "1 entraînement"},
         {"Idée": "GPT-4o fine-tuning multimodal",    "Gain attendu": "+3 à 5 pts", "Coût": "API payante"},
-        {"Idée": "Augmentation image + TTA",         "Gain attendu": "+0.5 à 1 pt","Coût": "Re-training"},
     ])
     st.dataframe(persp, width="stretch", hide_index=True)
 
@@ -867,7 +984,8 @@ image ───► CLIP preprocess (224×224) ───┐                      
 - 🤖 **Artefacts v2** (`models/v2/`) :
     - `camembert_ft_best.pth` — CamemBERT fine-tuné (442 MB)
     - `clip_mlp_best.pth` — Tête image CLIP+MLP (1.6 MB)
-    - `meta_E1.pkl`, `meta_E2.pkl` — Stackers Logistic Regression
+    - `meta_E1.pkl`, `meta_E2.pkl` — Stackers Logistic Regression (texte-seul / image-seule)
+    - **`meta_best.pkl` — MetaMLP final (61 → 27)** : fusion utilisée quand les deux modalités sont présentes
     - `label_encoder.pkl`, `ctfidf_centroids.npy` — Outils de support
 - 📊 **17 figures** EDA + modélisation
 - 🎯 **Cette démo** Streamlit (CamemBERT + CLIP + stacking, sans ré-entraînement)

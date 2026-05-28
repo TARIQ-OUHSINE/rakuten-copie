@@ -47,26 +47,37 @@ Streamlit demo app
 
 A demo app (inference only — no retraining) is provided in `src/streamlit/app.py`.
 It exposes the full multimodal pipeline (CamemBERT fine-tuned + CLIP ViT-B/32 + MLP +
-Logistic Regression stackers) through five tabs: project context, data exploration,
-modeling results, live inference, and methodology.
+MetaMLP stacker) through five tabs: project context, data exploration, modeling
+results, live inference, and methodology.
 
 ### Architecture v2
 
-| Branch  | Backbone                                | Head                       | Output     |
-|---------|-----------------------------------------|----------------------------|------------|
-| Text    | `camembert-base` (110 M params, fine-tuned) | Classification 768 → 27   | 27 probs  |
-| Image   | `CLIP ViT-B/32` laion2b (frozen)        | MLP 512 → 512 → 256 → 27   | 27 probs  |
-| Stacker | Logistic Regression (`saga`, balanced)  | 27 → 27 per modality       | 27 probs  |
-| Fusion  | Arithmetic mean of stacked probs        | —                          | 27 probs  |
+| Branch        | Backbone                                | Head                                  | Output    |
+|---------------|-----------------------------------------|---------------------------------------|-----------|
+| Text          | `camembert-base` (110 M params, fine-tuned) | Classification 768 → 27           | 27 probs |
+| Image         | `CLIP ViT-B/32` laion2b (frozen)        | MLP 512 → 512 → 256 → 27              | 27 probs |
+| Stacker text  | Logistic Regression (`saga`, balanced) — `meta_E1` | 27 → 27                  | 27 probs |
+| Stacker image | Logistic Regression (`saga`, balanced) — `meta_E2` | 27 → 27                  | 27 probs |
+| **Fusion**    | **MetaMLP** (`meta_best.pkl`, NB05 best experiment) — FC → BN → ReLU → Dropout | **61 → (256, 128, 64) → 27** | **27 probs** |
+
+The MetaMLP fusion consumes a **61-feature vector** built per sample:
+
+```
+[ P_text (27) | P_image (27) | txt_entropy, txt_margin, txt_max_conf | img_entropy, img_margin, img_max_conf | agreement (1) ]
+```
+
+When only one modality is available (text-only or image-only), the corresponding
+per-modality stacker (`meta_E1` or `meta_E2`) is used as the final prediction.
 
 ### Artifacts (`models/v2/`)
 
 - `camembert_ft_best.pth` — fine-tuned CamemBERT (442 MB)
 - `clip_mlp_best.pth` — image MLP head (1.6 MB)
-- `meta_E1.pkl`, `meta_E2.pkl` — per-modality Logistic Regression stackers
+- `meta_E1.pkl`, `meta_E2.pkl` — per-modality Logistic Regression stackers (text-only / image-only paths)
+- `meta_best.pkl` — **MetaMLP final stacker** (61 → 27), used when both modalities are present
 - `label_encoder.pkl` — sklearn `LabelEncoder` over the 27 `prdtypecode` classes
 - `ctfidf_centroids.npy` — class-based TF-IDF centroids (support artifact)
-- `baseline_lgbm.pkl`, `meta_best.pkl` — additional artifacts (not currently wired up)
+- `baseline_lgbm.pkl` — optional LightGBM fallback baseline
 
 ### Data requirements
 
@@ -117,7 +128,7 @@ The app shows the top-3 prediction for each branch:
 
 - `Texte — CamemBERT + Meta-E1`
 - `Image — CLIP+MLP + Meta-E2`
-- `Fusion — Stacking E1 + E2`
+- `Fusion — MetaMLP (meta_best, 61 features)` 
 
 The fusion card is the primary prediction when both modalities are available.
 
