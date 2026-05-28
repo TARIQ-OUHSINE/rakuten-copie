@@ -1,0 +1,14 @@
+# Streamlit demo + inference pipeline (architecture v2)
+streamlit>=1.40
+pandas>=2.0
+numpy>=1.26
+plotly>=5.20
+scikit-learn>=1.5
+scipy>=1.13
+lightgbm>=4.0
+Pillow>=10.0
+
+# Deep learning inference (CamemBERT + CLIP)
+torch>=2.0
+transformers>=4.40
+sentencepiece>=0.2          # CamemBERT tokenizer

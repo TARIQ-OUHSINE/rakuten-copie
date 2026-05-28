@@ -1,41 +1,47 @@
 """
-app.py — Interface Démo Rakuten Classification Multimodale
+Rakuten France — Classification Multimodale
+Streamlit demo app (inference only — no retraining).
+
+Architecture v2 :
+    Texte  : CamemBERT fine-tuné → 27 probabilités
+    Image  : CLIP ViT-B/32 (laion2b) + MLP → 27 probabilités
+    Meta   : Logistic Regression stacker E1 (texte) + E2 (image)
+    Fusion : Moyenne des probabilités stackées
 
 Lancement :
-    cd <racine_projet>
-    streamlit run streamlit_app/app.py
-
-Contraintes : ZERO ré-entraînement. Tous les modèles sont chargés depuis
-models/clean/ et data/processed_clean/ (sorties des notebooks 1-5).
+    streamlit run src/streamlit/app.py
 """
 
 from __future__ import annotations
 
+import pickle
+import re
 import sys
-import time
-import logging
-from pathlib import Path
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
 
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
+# ── Project paths ────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = ROOT / "data"
+MODEL_DIR = ROOT / "models"
+MODEL_V2_DIR = MODEL_DIR / "v2"
+FIG_DIR = ROOT / "docs" / "figures"
+REPORT_FIG_DIR = ROOT / "reports" / "figures"
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / 'streamlit_app'))
+sys.path.insert(0, str(ROOT))
 
-from pipeline import RakutenPipeline, CLASS_NAMES, MODELS_DIR, PROCESSED_DIR, SPLIT_DIR
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-logging.basicConfig(level=logging.INFO)
-
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
-
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Rakuten — Classification Multimodale",
     page_icon="🛒",
@@ -43,819 +49,829 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ---------------------------------------------------------------------------
-# CSS Professionnel
-# ---------------------------------------------------------------------------
-
-st.markdown("""
+# ── CSS ──────────────────────────────────────────────────────────────────────
+st.markdown(
+    """
 <style>
-    /* Palette */
     :root {
         --primary: #BF0000;
+        --primary-dark: #8B0000;
         --primary-light: #ff4444;
         --bg-card: #f8f9fa;
         --border: #e0e0e0;
         --text-muted: #6c757d;
     }
+    .stApp { background: #ffffff; }
 
-    /* Header principal */
-    .main-header {
+    /* Hero header */
+    .hero {
         background: linear-gradient(135deg, #BF0000 0%, #8B0000 100%);
         color: white;
-        padding: 2rem 3rem;
-        border-radius: 12px;
-        margin-bottom: 2rem;
-        box-shadow: 0 4px 20px rgba(191,0,0,0.3);
+        padding: 2.2rem 3rem;
+        border-radius: 14px;
+        margin-bottom: 1.8rem;
+        box-shadow: 0 6px 24px rgba(191,0,0,0.25);
     }
-    .main-header h1 { font-size: 2.2rem; font-weight: 800; margin: 0; }
-    .main-header p  { font-size: 1rem; opacity: 0.85; margin: 0.4rem 0 0; }
+    .hero h1 { font-size: 2.3rem; font-weight: 800; margin: 0; }
+    .hero p { font-size: 1.05rem; opacity: 0.92; margin: 0.55rem 0 0; }
 
-    /* KPI Cards */
-    .kpi-card {
+    /* KPI cards */
+    .kpi {
         background: white;
         border: 1px solid var(--border);
-        border-radius: 10px;
-        padding: 1.2rem 1.5rem;
+        border-radius: 12px;
+        padding: 1.2rem 1rem;
         text-align: center;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        border-top: 3px solid var(--primary);
+        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+        border-top: 4px solid var(--primary);
+        height: 100%;
     }
-    .kpi-value { font-size: 2rem; font-weight: 800; color: var(--primary); }
-    .kpi-label { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.3rem; letter-spacing: 0.05em; text-transform: uppercase; }
+    .kpi-value { font-size: 1.9rem; font-weight: 800; color: var(--primary); line-height: 1.1; }
+    .kpi-label { font-size: 0.78rem; color: var(--text-muted); margin-top: 0.4rem;
+                 letter-spacing: 0.06em; text-transform: uppercase; }
 
-    /* Prédiction Result */
+    /* Section title */
+    .section-title {
+        font-size: 1.25rem; font-weight: 700; color: #2c3e50;
+        border-left: 4px solid var(--primary); padding-left: 0.8rem;
+        margin: 1.2rem 0 0.9rem;
+    }
+
+    /* Prediction cards */
     .pred-card {
         background: white;
         border: 2px solid var(--primary);
         border-radius: 12px;
-        padding: 2rem;
+        padding: 1.3rem;
+        box-shadow: 0 4px 14px rgba(191,0,0,0.12);
+    }
+    .pred-card-secondary {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 1.3rem;
+    }
+    .pred-model { font-size: 0.78rem; color: var(--text-muted);
+                  text-transform: uppercase; letter-spacing: 0.06em; }
+    .pred-class { font-size: 1.5rem; font-weight: 800; color: var(--primary);
+                  margin: 0.3rem 0; }
+    .pred-class-secondary { color: #2c3e50; }
+    .pred-conf { font-size: 0.95rem; color: var(--text-muted); }
+
+    /* Comment box */
+    .comment {
+        background: #fff7e6;
+        border-left: 4px solid #f39c12;
+        padding: 0.85rem 1rem;
+        border-radius: 6px;
+        margin: 0.6rem 0 1.2rem;
+        font-size: 0.93rem;
+        color: #5d4e2a;
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+    .stTabs [data-baseweb="tab"] {
+        background: #f1f3f5; border-radius: 8px 8px 0 0;
+        padding: 0.6rem 1.4rem; font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        background: var(--primary) !important; color: white !important;
+    }
+
+    /* Cap figure size so they don't dominate the viewport */
+    [data-testid="stImage"] {
+        display: flex;
+        justify-content: center;
+    }
+    [data-testid="stImage"] img {
+        max-width: 880px;
+        max-height: 520px;
+        width: auto;
+        height: auto;
+        object-fit: contain;
+        border-radius: 8px;
+    }
+    /* Image caption styling */
+    [data-testid="stImageCaption"], [data-testid="stImage"] figcaption {
         text-align: center;
-        box-shadow: 0 4px 16px rgba(191,0,0,0.15);
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        font-style: italic;
+        max-width: 880px;
+        margin: 0.4rem auto 0;
     }
-    .pred-class { font-size: 1.8rem; font-weight: 800; color: var(--primary); }
-    .pred-conf  { font-size: 1rem; color: var(--text-muted); margin-top: 0.4rem; }
-
-    /* Section titres */
-    .section-title {
-        font-size: 1.2rem;
-        font-weight: 700;
-        color: #2c3e50;
-        border-left: 4px solid var(--primary);
-        padding-left: 0.8rem;
-        margin: 1.5rem 0 1rem;
-    }
-
-    /* Status badges */
-    .badge-ok   { background: #d4edda; color: #155724; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; }
-    .badge-warn { background: #fff3cd; color: #856404; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; }
-    .badge-err  { background: #f8d7da; color: #721c24; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; }
-
-    /* Masquer le menu Streamlit par défaut */
-    #MainMenu { visibility: hidden; }
-    footer     { visibility: hidden; }
-    header     { visibility: hidden; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ---------------------------------------------------------------------------
-# Chargement des ressources (cache Streamlit)
-# ---------------------------------------------------------------------------
+# ── Class names (Rakuten France 27 categories) ───────────────────────────────
+CLASS_NAMES = {
+    10:   "Livre occasion",
+    40:   "Jeux vidéo neufs",
+    50:   "Accessoires gaming",
+    60:   "Consoles de jeux",
+    1140: "Figurines",
+    1160: "Cartes à collectionner",
+    1180: "Jeux de rôle / Figurines",
+    1280: "Jouets enfants",
+    1281: "Jeux de société",
+    1300: "Modélisme",
+    1301: "Articles bébé",
+    1302: "Jouets de plein air",
+    1320: "Puériculture / Peluches",
+    1560: "Mobilier",
+    1920: "Linge de maison",
+    1940: "Épicerie",
+    2060: "Décoration",
+    2220: "Animalerie",
+    2280: "Magazines / Journaux",
+    2403: "Livres et BD anciens",
+    2462: "Jeux occasion",
+    2522: "Papeterie",
+    2582: "Mobilier de jardin",
+    2583: "Piscine / Spa",
+    2585: "Outillage de jardin",
+    2705: "Livres neufs",
+    2905: "Jeu PC dématérialisé",
+}
 
-@st.cache_resource(show_spinner="Chargement du pipeline d'inférence...")
-def get_pipeline() -> RakutenPipeline:
-    pipe = RakutenPipeline()
-    pipe.load_static_artifacts()
-    return pipe
-
-
-@st.cache_data(show_spinner=False)
-def load_eda_data() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """Charge stats_par_classe.csv et train.csv (sample)."""
-    stats = None
-    sample = None
-
-    stats_path = PROCESSED_DIR / 'stats_par_classe.csv'
-    if stats_path.exists():
-        stats = pd.read_csv(stats_path)
-
-    train_path = SPLIT_DIR / 'train.csv'
-    if train_path.exists():
-        sample = pd.read_csv(train_path)
-
-    return stats, sample
-
-
-@st.cache_data(show_spinner=False)
-def load_benchmark() -> pd.DataFrame | None:
-    p = MODELS_DIR / 'benchmark_final.csv'
-    if p.exists():
-        return pd.read_csv(p)
-    # Resultats hardcodes si benchmark pas encore genere
-    return pd.DataFrame([
-        {'Systeme': 'SIGIR 2020 — 1er place',     'F1_Test': 0.9194, 'Type': 'Référence'},
-        {'Systeme': 'SIGIR 2020 — Baseline',       'F1_Test': 0.8705, 'Type': 'Référence'},
-        {'Systeme': 'Stacking Final (NB5)',         'F1_Test': 0.8541, 'Type': 'Nos modèles'},
-        {'Systeme': 'Texte seul — LogReg (NB3)',    'F1_Test': 0.8340, 'Type': 'Nos modèles'},
-        {'Systeme': 'Baseline LightGBM (NB2)',      'F1_Test': 0.8050, 'Type': 'Nos modèles'},
-        {'Systeme': 'Image seule — DINOv2 (NB4)',   'F1_Test': 0.6117, 'Type': 'Nos modèles'},
-    ])
+CAMEMBERT_REPO = "camembert-base"
+CLIP_REPO = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
 
 
-@st.cache_resource
-def get_e5_loaded_pipeline() -> RakutenPipeline:
-    """Pipeline avec e5-large pre-charge (pour onglet inference)."""
-    pipe = get_pipeline()
-    pipe.load_e5()
-    return pipe
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def kpi(value: str, label: str) -> str:
+    return f'<div class="kpi"><div class="kpi-value">{value}</div><div class="kpi-label">{label}</div></div>'
 
 
-# ---------------------------------------------------------------------------
-# Helpers visuels
-# ---------------------------------------------------------------------------
-
-def kpi_card(value: str, label: str) -> str:
-    return f"""
-    <div class="kpi-card">
-        <div class="kpi-value">{value}</div>
-        <div class="kpi-label">{label}</div>
-    </div>"""
+def comment(text: str) -> None:
+    st.markdown(f'<div class="comment">💡 {text}</div>', unsafe_allow_html=True)
 
 
-def make_bar_chart_px(df, x, y, title, color=None, orientation='v'):
-    import plotly.express as px
-    color_map = {'Référence': '#f39c12', 'Nos modèles': '#BF0000'}
-    kwargs = dict(title=title, template='plotly_white', height=420)
-    if color and color in df.columns:
-        kwargs['color'] = color
-        kwargs['color_discrete_map'] = color_map
-    if orientation == 'h':
-        fig = px.bar(df, x=x, y=y, orientation='h', **kwargs)
-    else:
-        fig = px.bar(df, x=x, y=y, **kwargs)
-    fig.update_layout(
-        title_font_size=14, margin=dict(l=20, r=20, t=50, b=20),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+def clean_text(text: str) -> str:
+    """Light cleaning consistent with the training-time preprocessing."""
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def find_figure(name: str) -> Path | None:
+    for d in (FIG_DIR, REPORT_FIG_DIR):
+        p = d / name
+        if p.exists():
+            return p
+    return None
+
+
+# ── Image classifier head (matches clip_mlp_best.pth) ────────────────────────
+class CLIPHead(nn.Module):
+    """MLP head trained on top of L2-normalized CLIP image embeddings (512-d)."""
+
+    def __init__(self, in_dim: int = 512, n_classes: int = 27, dropout: float = 0.3):
+        super().__init__()
+        # Sequential indices must match the saved state_dict
+        # (net.0 Linear, net.1 BN, net.4 Linear, net.5 BN, net.8 Linear)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 512),     # 0
+            nn.BatchNorm1d(512),        # 1
+            nn.GELU(),                  # 2
+            nn.Dropout(dropout),        # 3
+            nn.Linear(512, 256),        # 4
+            nn.BatchNorm1d(256),        # 5
+            nn.GELU(),                  # 6
+            nn.Dropout(dropout),        # 7
+            nn.Linear(256, n_classes),  # 8
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ── Cached loaders ───────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Chargement du tokenizer + CamemBERT fine-tuné…")
+def load_text_model():
+    from transformers import AutoTokenizer, CamembertForSequenceClassification
+
+    tokenizer = AutoTokenizer.from_pretrained(CAMEMBERT_REPO)
+    model = CamembertForSequenceClassification.from_pretrained(
+        CAMEMBERT_REPO, num_labels=27
     )
-    return fig
+    state = torch.load(MODEL_V2_DIR / "camembert_ft_best.pth", map_location=DEVICE, weights_only=True)
+    model.load_state_dict(state)
+    model.eval().to(DEVICE)
+    return tokenizer, model
 
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Chargement de CLIP + MLP image…")
+def load_image_model():
+    from transformers import CLIPModel, CLIPProcessor
 
-st.markdown("""
-<div class="main-header">
+    clip = CLIPModel.from_pretrained(CLIP_REPO)
+    processor = CLIPProcessor.from_pretrained(CLIP_REPO)
+    clip.eval().to(DEVICE)
+
+    head = CLIPHead(in_dim=512, n_classes=27)
+    state = torch.load(MODEL_V2_DIR / "clip_mlp_best.pth", map_location=DEVICE, weights_only=True)
+    head.load_state_dict(state)
+    head.eval().to(DEVICE)
+    return clip, processor, head
+
+
+@st.cache_resource(show_spinner="Chargement des stackers…")
+def load_stackers():
+    with open(MODEL_V2_DIR / "label_encoder.pkl", "rb") as f:
+        le = pickle.load(f)
+    with open(MODEL_V2_DIR / "meta_E1.pkl", "rb") as f:
+        meta_text = pickle.load(f)
+    with open(MODEL_V2_DIR / "meta_E2.pkl", "rb") as f:
+        meta_image = pickle.load(f)
+    return le, meta_text, meta_image
+
+
+@st.cache_data(show_spinner=False)
+def load_class_stats() -> pd.DataFrame:
+    """Per-class stats from train_cleaned.pkl (cached)."""
+    train = pd.read_pickle(DATA_DIR / "train_cleaned.pkl")
+    rows = []
+    for code, sub in train.groupby("prdtypecode"):
+        rows.append({
+            "code": int(code),
+            "classe": CLASS_NAMES.get(int(code), f"Classe {code}"),
+            "n_produits": len(sub),
+            "pct_total": 100 * len(sub) / len(train),
+            "pct_missing_desc": 100 * (1 - sub["has_description"].mean()),
+            "mots_moyens": sub["word_count"].mean(),
+        })
+    return pd.DataFrame(rows).sort_values("n_produits", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_lang_stats() -> pd.DataFrame | None:
+    p = DATA_DIR / "train_translated.pkl"
+    if not p.exists():
+        return None
+    df = pd.read_pickle(p)
+    if "lang" not in df.columns:
+        return None
+    counts = df["lang"].value_counts().reset_index()
+    counts.columns = ["langue", "n_produits"]
+    counts["pct"] = 100 * counts["n_produits"] / counts["n_produits"].sum()
+    return counts
+
+
+@st.cache_data(show_spinner=False)
+def load_sample_designations(n: int = 6) -> list[dict]:
+    """A few example products for the demo tab."""
+    train = pd.read_pickle(DATA_DIR / "train_cleaned.pkl")
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(train), size=n, replace=False)
+    samples = []
+    for i in idx:
+        row = train.iloc[i]
+        samples.append({
+            "designation": str(row["designation"])[:200],
+            "description": str(row["description"])[:400] if pd.notna(row["description"]) else "",
+            "true_code": int(row["prdtypecode"]),
+            "true_name": CLASS_NAMES.get(int(row["prdtypecode"]), "?"),
+        })
+    return samples
+
+
+# ── Inference helpers ────────────────────────────────────────────────────────
+@torch.inference_mode()
+def predict_text_probs(designation: str, description: str) -> np.ndarray | None:
+    """Run CamemBERT on cleaned designation+description, return 27-d softmax."""
+    text = clean_text(f"{designation} {description}")
+    if not text:
+        return None
+    tokenizer, model = load_text_model()
+    enc = tokenizer(
+        text, truncation=True, max_length=256, padding=True, return_tensors="pt"
+    ).to(DEVICE)
+    logits = model(**enc).logits[0]
+    return F.softmax(logits, dim=-1).cpu().numpy()
+
+
+@torch.inference_mode()
+def predict_image_probs(pil_img: Image.Image) -> np.ndarray:
+    """Encode image with CLIP, classify with the MLP head, return 27-d softmax."""
+    clip, processor, head = load_image_model()
+    inputs = processor(images=pil_img.convert("RGB"), return_tensors="pt").to(DEVICE)
+    feats = clip.get_image_features(**inputs)
+    feats = feats / feats.norm(dim=-1, keepdim=True)
+    # BatchNorm needs >1 sample → repeat then take the first row
+    feats_bn = feats.repeat(2, 1) if feats.shape[0] == 1 else feats
+    head.eval()  # disable BN updates; running stats are used in eval mode
+    logits = head(feats_bn)[0]
+    return F.softmax(logits, dim=-1).cpu().numpy()
+
+
+def stack_top3(probs: np.ndarray, le) -> list[tuple[int, str, float]]:
+    """Convert a 27-d probability vector into a sorted list of (code, name, p)."""
+    order = np.argsort(probs)[::-1][:3]
+    out = []
+    for idx in order:
+        code = int(le.classes_[idx])
+        out.append((code, CLASS_NAMES.get(code, f"Classe {code}"), float(probs[idx])))
+    return out
+
+
+# ── Header ───────────────────────────────────────────────────────────────────
+st.markdown(
+    """
+<div class="hero">
     <h1>🛒 Rakuten France — Classification Multimodale</h1>
-    <p>84 916 produits · 27 catégories · Texte + Image · Challenge SIGIR eCommerce 2020</p>
+    <p>84 916 produits · 27 catégories · CamemBERT + CLIP+MLP · Challenge SIGIR eCommerce 2020</p>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ---------------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------------
+# Light artifacts (stackers + label encoder) load instantly
+LE, META_TEXT, META_IMAGE = load_stackers()
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🏠 Présentation",
     "📊 Exploration des données",
-    "🏆 Performances & Benchmark",
-    "🔮 Inférence Multimodale",
-    "🔍 Interprétabilité",
+    "🤖 Modélisation",
+    "🔮 Démo Inférence",
+    "📚 Méthodologie",
 ])
 
-# ===========================================================================
-# TAB 1 — EDA
-# ===========================================================================
-
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 1 — PRÉSENTATION
+# ═════════════════════════════════════════════════════════════════════════════
 with tab1:
-    stats_df, train_sample = load_eda_data()
+    st.markdown('<div class="section-title">Contexte du projet</div>', unsafe_allow_html=True)
 
-    # --- KPIs ---
+    col_text, col_img = st.columns([2, 1])
+    with col_text:
+        st.markdown("""
+**Rakuten France** est l'une des plus grandes marketplaces e-commerce en Europe. Chaque jour,
+des milliers de vendeurs ajoutent de nouveaux produits sur la plateforme. La **classification
+automatique du type de produit** (`prdtypecode`) est essentielle pour :
+
+- 🔎 Le **moteur de recherche** : trouver rapidement les produits pertinents
+- 📂 L'**organisation du catalogue** : navigation par catégorie
+- 🎯 Les **recommandations** : suggérer des produits similaires
+- 💼 La **gestion commerciale** : analyses de marché par segment
+
+**Le défi** : les listings contiennent du texte (souvent court et bruité, multilingue) et
+une image produit. Ces deux modalités doivent être combinées intelligemment pour atteindre
+une classification fiable sur **27 catégories** très hétérogènes.
+
+> *Source : Challenge SIGIR eCommerce 2020, organisé conjointement par Rakuten France
+> et l'ACM SIGIR. La baseline officielle (TF-IDF + classifieur linéaire) atteint
+> ~0.87 de F1 ; la meilleure soumission ~0.92.*
+        """)
+    with col_img:
+        st.markdown(
+            """
+<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+            height:100%;min-height:280px;padding:2rem 1rem;
+            background:linear-gradient(135deg,#BF0000,#8B0000);
+            border-radius:14px;color:white;
+            box-shadow:0 6px 20px rgba(191,0,0,0.25);">
+    <div style="font-size:5rem;font-weight:900;line-height:1;">R</div>
+    <div style="font-size:1.4rem;font-weight:700;margin-top:0.4rem;letter-spacing:0.05em;">Rakuten</div>
+    <div style="font-size:0.85rem;opacity:0.85;margin-top:0.3rem;">SIGIR eCommerce 2020</div>
+    <div style="font-size:0.75rem;opacity:0.7;margin-top:1rem;">🇫🇷 France marketplace</div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     st.markdown('<div class="section-title">Vue d\'ensemble du dataset</div>', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: st.markdown(kpi("84 916", "Produits"), unsafe_allow_html=True)
+    with c2: st.markdown(kpi("27", "Catégories"), unsafe_allow_html=True)
+    with c3: st.markdown(kpi("35%", "Desc. manquantes"), unsafe_allow_html=True)
+    with c4: st.markdown(kpi("79%", "Produits en FR"), unsafe_allow_html=True)
+    with c5: st.markdown(kpi("13×", "Ratio déséquilibre"), unsafe_allow_html=True)
 
-    total = 84_916
-    n_classes = 27
-    missing_pct = 35.0
-    pct_fr = 79.0
-    imbalance = 13.0
+    st.markdown('<div class="section-title">Approche en 4 phases</div>', unsafe_allow_html=True)
+    phases = pd.DataFrame([
+        {"Phase": "1 — Baseline",      "Modèle": "TF-IDF + LightGBM",              "Modalités": "Texte",            "Statut": "✅ Livré"},
+        {"Phase": "2 — Optimisation",  "Modèle": "TF-IDF + OpenCV + LightGBM",     "Modalités": "Texte + Image",    "Statut": "✅ Livré"},
+        {"Phase": "2 bis — Translation","Modèle": "TF-IDF (FR) + LightGBM",        "Modalités": "Texte traduit FR", "Statut": "✅ Livré"},
+        {"Phase": "3 — Deep texte",    "Modèle": "CamemBERT fine-tuné",            "Modalités": "Texte FR",         "Statut": "🚀 Déployé"},
+        {"Phase": "3 — Deep image",    "Modèle": "CLIP ViT-B/32 + MLP",            "Modalités": "Image",            "Statut": "🚀 Déployé"},
+        {"Phase": "4 — Stacking",      "Modèle": "Meta-LR (E1 texte + E2 image)",  "Modalités": "Multimodal",       "Statut": "🚀 Déployé"},
+    ])
+    st.dataframe(phases, width="stretch", hide_index=True)
 
-    with c1: st.markdown(kpi_card(f"{total:,}", "Produits total"), unsafe_allow_html=True)
-    with c2: st.markdown(kpi_card(str(n_classes), "Classes"), unsafe_allow_html=True)
-    with c3: st.markdown(kpi_card(f"{missing_pct:.0f}%", "Desc. manquantes"), unsafe_allow_html=True)
-    with c4: st.markdown(kpi_card(f"{pct_fr:.0f}%", "Produits en Français"), unsafe_allow_html=True)
-    with c5: st.markdown(kpi_card(f"{imbalance:.0f}x", "Ratio déséquilibre"), unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # --- Distributions ---
-    if stats_df is not None:
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            import plotly.express as px
-            st.markdown('<div class="section-title">Répartition des classes</div>', unsafe_allow_html=True)
-            df_sorted = stats_df.sort_values('N produits', ascending=True)
-            fig = px.bar(
-                df_sorted, x='N produits', y='class_name', orientation='h',
-                color='N produits', color_continuous_scale='Reds',
-                template='plotly_white', height=520,
-                labels={'N produits': 'Nb produits', 'class_name': ''},
-            )
-            fig.update_coloraxes(showscale=False)
-            fig.update_layout(margin=dict(l=10, r=20, t=20, b=20))
-            st.plotly_chart(fig, use_container_width=True)
-
-        with col_right:
-            st.markdown('<div class="section-title">Descriptions manquantes par classe</div>', unsafe_allow_html=True)
-            miss_col = [c for c in stats_df.columns if 'desc' in c.lower() and 'manquante' in c.lower()]
-            if miss_col:
-                df_miss = stats_df.sort_values(miss_col[0], ascending=True)
-                colors = ['#e74c3c' if v > 50 else '#f39c12' if v > 20 else '#2ecc71'
-                          for v in df_miss[miss_col[0]]]
-                fig2 = px.bar(
-                    df_miss, x=miss_col[0], y='class_name', orientation='h',
-                    template='plotly_white', height=520,
-                    labels={miss_col[0]: '% manquant', 'class_name': ''},
-                    color=miss_col[0], color_continuous_scale=['#2ecc71', '#f39c12', '#e74c3c'],
-                )
-                fig2.update_coloraxes(showscale=False)
-                fig2.add_vline(x=35, line_dash='dash', line_color='navy',
-                               annotation_text='Moyenne 35%', annotation_position='top right')
-                fig2.update_layout(margin=dict(l=10, r=20, t=20, b=20))
-                st.plotly_chart(fig2, use_container_width=True)
-
-        # --- Stats table ---
-        st.markdown('<div class="section-title">Statistiques détaillées par classe</div>', unsafe_allow_html=True)
-        st.dataframe(
-            stats_df.set_index('class_name').style
-            .background_gradient(cmap='Reds', subset=['N produits'])
-            .format(precision=1),
-            use_container_width=True,
-            height=400,
-        )
-
-    else:
-        st.info("Les statistiques EDA seront disponibles après exécution du **Notebook 1** (`01_preprocessing_eda.ipynb`).")
-
-    # --- Figures pre-calculees ---
-    st.markdown('<div class="section-title">Visualisations EDA pré-calculées</div>', unsafe_allow_html=True)
-
-    FIGURES_DIR = ROOT / 'reports' / 'figures'
-    fig_map = [
-        ('graph01_class_distribution.png', 'Distribution des classes'),
-        ('graph02_language_distribution.png', 'Distribution des langues'),
-        ('graph03_text_length_by_class.png', 'Longueur texte par classe'),
-        ('graph04_missing_desc_by_class.png', 'Descriptions manquantes'),
-        ('graph05_wordclouds.png', 'Nuages de mots'),
-        ('graph07_image_quality.png', 'Qualité des images'),
-        ('graph08_autocrop_examples.png', 'Auto-crop exemples'),
-    ]
-
-    available_figs = [(fname, label) for fname, label in fig_map
-                       if (FIGURES_DIR / fname).exists()]
-
-    if available_figs:
-        cols = st.columns(min(3, len(available_figs)))
-        for i, (fname, label) in enumerate(available_figs):
-            col = cols[i % len(cols)]
-            with col:
-                st.image(str(FIGURES_DIR / fname), caption=label, use_column_width=True)
-    else:
-        st.info("Exécutez le **Notebook 1** pour générer les figures EDA.")
-
-    # --- Exemples de produits ---
-    if train_sample is not None and 'prdtypecode' in train_sample.columns:
-        st.markdown('<div class="section-title">Exemples de produits par classe</div>', unsafe_allow_html=True)
-
-        all_classes = sorted(train_sample['prdtypecode'].unique())
-        codes_with_names = {str(c): CLASS_NAMES.get(c, str(c)) for c in all_classes}
-        selected_label = st.selectbox(
-            "Choisir une classe :",
-            options=list(codes_with_names.keys()),
-            format_func=lambda k: f"{CLASS_NAMES.get(int(k), k)} (code {k})",
-            key='eda_class_select'
-        )
-
-        if selected_label:
-            cls_code = int(selected_label)
-            subset = train_sample[train_sample['prdtypecode'] == cls_code].head(6)
-            img_dir = SPLIT_DIR / 'train'
-
-            example_cols = st.columns(min(6, len(subset)))
-            for col, (_, row) in zip(example_cols, subset.iterrows()):
-                img_path = img_dir / str(row.get('image_name', ''))
-                with col:
-                    if img_path.exists():
-                        st.image(str(img_path), use_column_width=True)
-                    else:
-                        st.markdown("🖼️ Image non disponible")
-                    text_preview = str(row.get('text_combined', row.get('text_combined_raw', '')))[:60]
-                    st.caption(text_preview + '...')
-
-# ===========================================================================
-# TAB 2 — BENCHMARK
-# ===========================================================================
-
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 2 — EXPLORATION
+# ═════════════════════════════════════════════════════════════════════════════
 with tab2:
-    import plotly.express as px
-    import plotly.graph_objects as go
+    st.caption("📄 Figures issues de **Etape1_rendu.docx** — source de vérité du rendu d'exploration.")
 
-    bench = load_benchmark()
+    def show_fig(fname: str, caption: str) -> None:
+        p = find_figure(fname)
+        if p is not None:
+            st.image(str(p), caption=caption, width="stretch")
+        else:
+            st.warning(f"Figure introuvable : `{fname}`")
 
-    st.markdown('<div class="section-title">Benchmark comparatif — F1 Score (weighted)</div>', unsafe_allow_html=True)
+    # ── §1 Distribution des classes ──────────────────────────────────────
+    st.markdown('<div class="section-title">1 · Distribution des classes</div>', unsafe_allow_html=True)
+    show_fig("etape1_fig1_class_distribution.png", "Répartition des 27 catégories produits Rakuten")
+    comment("**Déséquilibre des classes** : ratio **13:1** entre la classe majoritaire (2583 — Piscine/Spa) "
+            "et la classe minoritaire (1180). Validé par un **test du Chi² (p < 0.001)**. "
+            "Conséquence directe sur la modélisation : `class_weight='balanced'` et **F1 pondéré** comme métrique.")
 
-    if bench is not None:
-        bench_sorted = bench.sort_values('F1_Test', ascending=False).reset_index(drop=True)
+    # ── §2 Descriptions manquantes ───────────────────────────────────────
+    st.markdown('<div class="section-title">2 · Descriptions manquantes par classe</div>', unsafe_allow_html=True)
+    show_fig("etape1_fig2_missing_desc.png", "% de descriptions absentes et produits avec / sans description par classe")
+    comment("**35 % de descriptions absentes**, taux qui **varie fortement par classe** "
+            "(Chi² p < 0.001 → non aléatoire). Stratégie : feature binaire `has_desc` + concaténation "
+            "`designation + description` pour éviter les NaN, et compensation par la **modalité image**.")
 
-        # --- Graphique principal ---
-        type_col = 'Type' if 'Type' in bench_sorted.columns else None
-        color_discrete = {'Référence': '#f39c12', 'Nos modèles': '#BF0000'}
+    # ── §3 Distribution des langues par classe ───────────────────────────
+    st.markdown('<div class="section-title">3 · Distribution des langues par classe</div>', unsafe_allow_html=True)
+    show_fig("etape1_fig3_languages.png", "Répartition globale des langues + composition par classe (top 15)")
+    show_fig("etape1_fig3b_lang_heatmap.png", "Heatmap langue × classe (%)")
+    comment("~**84 % français**, multilinguisme **fr / en / de / es**. La dépendance langue × classe "
+            "est significative (**Chi² p < 0.001**) : certaines classes (accessoires gaming) sont quasi "
+            "exclusivement en anglais. → Encodage one-hot de la feature `language` (5 colonnes).")
 
-        fig = px.bar(
-            bench_sorted,
-            x='Systeme', y='F1_Test',
-            color=type_col,
-            color_discrete_map=color_discrete if type_col else {},
-            text='F1_Test',
-            template='plotly_white',
-            height=460,
-            labels={'F1_Test': 'F1 Score (weighted)', 'Systeme': ''},
-        )
-        fig.update_traces(texttemplate='%{text:.4f}', textposition='outside')
-        fig.add_hline(y=0.9194, line_dash='dot', line_color='#27ae60',
-                      annotation_text='SIGIR 1er (0.9194)', annotation_position='top right',
-                      annotation_font_size=11)
-        fig.add_hline(y=0.8705, line_dash='dot', line_color='#f39c12',
-                      annotation_text='SIGIR baseline (0.8705)', annotation_position='top right',
-                      annotation_font_size=11)
-        fig.update_layout(
-            xaxis_tickangle=-25,
-            yaxis_range=[0.5, 1.0],
-            legend_title_text='',
-            margin=dict(l=20, r=20, t=60, b=80),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # ── §4 Longueur du texte par classe ──────────────────────────────────
+    st.markdown('<div class="section-title">4 · Longueur du texte par classe</div>', unsafe_allow_html=True)
+    show_fig("etape1_fig4_text_length.png", "Histogrammes + boxplots de la longueur (désignation & description)")
+    comment("Désignations courtes (**médiane ~8 mots**), descriptions très variables (0 → 1000+ mots). "
+            "La longueur est **discriminante par classe** : **Kruskal-Wallis p < 0.001**. "
+            "→ Features `len_desig`, `len_desc`, `len_combined` standardisées et injectées dans le modèle.")
 
-        # --- Tableau interactif ---
-        col_l, col_r = st.columns([2, 1])
-        with col_l:
-            st.markdown('<div class="section-title">Tableau détaillé</div>', unsafe_allow_html=True)
-            bench_display = bench_sorted.copy()
-            bench_display['F1_Test'] = bench_display['F1_Test'].map(lambda x: f"{x:.4f}")
-            best_score = float(bench_sorted.iloc[0]['F1_Test'])
-            ref_sigir = 0.9194
+    # ── §5 Top mots par classe ───────────────────────────────────────────
+    st.markdown('<div class="section-title">5 · Top mots par classe (signal lexical)</div>', unsafe_allow_html=True)
+    show_fig("etape1_fig5_top_words.png", "Top 12 mots — exemples sur 3 classes très différenciées")
+    comment("Chaque classe possède un **vocabulaire distinctif** : *piscine / kit / bâche* pour Piscines, "
+            "*cuisine / matelas / chaise* pour Mobilier, *drone / dji / quadcopter* pour Modélisme. "
+            "→ Le signal textuel est **très informatif** pour la classification, justifie TF-IDF et CamemBERT.")
 
-            def row_style(row):
-                if 'SIGIR' in str(row.get('Systeme', '')):
-                    return ['background-color: #fff8e1'] * len(row)
-                elif row.name == 0:
-                    return ['background-color: #ffe8e8; font-weight: bold'] * len(row)
-                return [''] * len(row)
+    # ── §6 % images mal cadrées par classe ──────────────────────────────
+    st.markdown('<div class="section-title">6 · % images mal cadrées par classe</div>', unsafe_allow_html=True)
+    show_fig("etape1_fig6_bad_crop.png", "% d'images mal cadrées (zoom_ratio < 0.7) — relatif + absolu")
+    comment("Analyse **originale** sur la qualité du cadrage : ~**48 %** d'images mal cadrées en moyenne, "
+            "fortement dépendant de la classe (**Chi² = 8 985, p < 0.001**). "
+            "→ Solution : `auto_crop()` qui détecte la bounding box des pixels non-blancs et recadre.")
 
-            st.dataframe(bench_display, use_container_width=True, hide_index=True)
+    # ── Bloc Preprocessing ───────────────────────────────────────────────
+    st.markdown('<div class="section-title">Preprocessing — avant / après</div>', unsafe_allow_html=True)
+    st.markdown(
+        "Quatre visualisations valident l'effet du pipeline de nettoyage (texte + image) "
+        "présenté dans la section Méthodologie."
+    )
+    cA, cB = st.columns(2)
+    with cA:
+        show_fig("etape1_preproc_graphA_text.png", "Graph A — texte BRUT vs NETTOYÉ (HTML, stopwords, ponctuation)")
+        show_fig("etape1_preproc_graphC_vocab.png", "Graph C — −21 % de mots uniques après preprocessing")
+    with cB:
+        show_fig("etape1_preproc_graphB_length.png", "Graph B — longueur de texte avant / après nettoyage")
+        show_fig("etape1_preproc_white_ratio.png", "Distribution du ratio de pixels blancs (seuil 70 %)")
+    show_fig("etape1_preproc_bad_examples.png", "Exemples d'images avec > 70 % de pixels blancs (mal cadrées)")
+    show_fig("etape1_preproc_autocrop.png", "Auto-crop — résultats avant / après recadrage")
+    comment("Le preprocessing **réduit le bruit textuel** (vocab −21 %, longueur médiane 48 → 33 mots) "
+            "et **standardise les images** (recadrage automatique sur fond blanc). "
+            "Ce sont les leviers les plus déterminants pour la performance finale.")
 
-        with col_r:
-            st.markdown('<div class="section-title">Positionnement</div>', unsafe_allow_html=True)
-            our_best = float(bench_sorted[bench_sorted.get('Type', pd.Series()) == 'Nos modèles']['F1_Test'].max()
-                             if 'Type' in bench_sorted.columns else bench_sorted.iloc[0]['F1_Test'])
-
-            gap_baseline = our_best - 0.8705
-            gap_champion = our_best - 0.9194
-
-            st.metric("Notre meilleur score", f"{our_best:.4f}")
-            st.metric("vs SIGIR Baseline",
-                      f"{our_best:.4f}",
-                      delta=f"{gap_baseline:+.4f}",
-                      delta_color="normal")
-            st.metric("vs SIGIR Champion",
-                      f"{our_best:.4f}",
-                      delta=f"{gap_champion:.4f}",
-                      delta_color="inverse")
-
-            pct_gap = (1 - our_best / 0.9194) * 100
-            st.markdown(f"**Écart vs champion :** {pct_gap:.1f}% de performance restante")
-
-        # --- Radar chart modalités ---
-        st.markdown('<div class="section-title">Apport de chaque modalité</div>', unsafe_allow_html=True)
-
-        modality_data = {
-            'Modalité': ['Texte seul', 'Image seule', 'Baseline (LightGBM)', 'Stacking Final'],
-            'F1_Score': [0.8340, 0.6117, 0.8050, 0.8541],
-        }
-        try:
-            for _, row in bench_sorted.iterrows():
-                s = str(row['Systeme'])
-                f = float(row['F1_Test']) if isinstance(row['F1_Test'], (int, float)) else float(row['F1_Test'].replace(',', '.'))
-                if 'texte' in s.lower() or 'text' in s.lower():
-                    modality_data['F1_Score'][0] = f
-                elif 'image' in s.lower() or 'dino' in s.lower():
-                    modality_data['F1_Score'][1] = f
-                elif 'baseline' in s.lower() or 'lgbm' in s.lower():
-                    modality_data['F1_Score'][2] = f
-                elif 'stacking' in s.lower() or 'final' in s.lower():
-                    modality_data['F1_Score'][3] = f
-        except Exception:
-            pass
-
-        df_mod = pd.DataFrame(modality_data)
-        fig_mod = px.bar(
-            df_mod, x='Modalité', y='F1_Score',
-            color='F1_Score', color_continuous_scale='Reds',
-            text='F1_Score', template='plotly_white', height=320,
-            labels={'F1_Score': 'F1 Score (weighted)'},
-        )
-        fig_mod.update_traces(texttemplate='%{text:.4f}', textposition='outside')
-        fig_mod.update_coloraxes(showscale=False)
-        fig_mod.update_layout(yaxis_range=[0.5, 1.0], margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig_mod, use_container_width=True)
-
-    else:
-        st.info("Le benchmark sera disponible après exécution du **Notebook 5** (`05_stacking_final.ipynb`).")
-
-# ===========================================================================
-# TAB 3 — INFÉRENCE MULTIMODALE
-# ===========================================================================
-
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 — MODÉLISATION
+# ═════════════════════════════════════════════════════════════════════════════
 with tab3:
-    st.markdown('<div class="section-title">Testez la classification en temps réel</div>', unsafe_allow_html=True)
+    st.caption("📄 Figures issues de **Rendu 2 — Modélisation.docx** + `reports/figures/`.")
 
-    # --- Status pipeline ---
-    pipe = get_pipeline()
-    artifact_status = pipe.load_static_artifacts()
+    # ── Benchmark global ─────────────────────────────────────────────────
+    st.markdown('<div class="section-title">Comparaison des modèles (weighted F1 — test)</div>',
+                unsafe_allow_html=True)
+    bench = pd.DataFrame([
+        {"Modèle": "SIGIR 2020 — 1ère place",                "F1 pondéré": 0.9144, "Type": "Référence"},
+        {"Modèle": "Stacking final (E11) — Meta-MLP",        "F1 pondéré": 0.8960, "Type": "Notre modèle"},
+        {"Modèle": "CamemBERT fine-tuné (texte)",            "F1 pondéré": 0.8760, "Type": "Notre modèle"},
+        {"Modèle": "SIGIR 2020 — Baseline",                  "F1 pondéré": 0.8705, "Type": "Référence"},
+        {"Modèle": "TF-IDF + LightGBM + c-TF-IDF (EXP_T_KW)","F1 pondéré": 0.8480, "Type": "Notre modèle"},
+        {"Modèle": "TF-IDF + LightGBM baseline (multimodal)","F1 pondéré": 0.8321, "Type": "Notre modèle"},
+        {"Modèle": "CLIP ViT-B/32 fine-tuné (image)",        "F1 pondéré": 0.6774, "Type": "Notre modèle"},
+    ])
+    fig_bench = px.bar(
+        bench.sort_values("F1 pondéré", ascending=True),
+        x="F1 pondéré", y="Modèle", orientation="h",
+        color="Type", color_discrete_map={"Référence": "#f39c12", "Notre modèle": "#BF0000"},
+        text="F1 pondéré", template="plotly_white", height=460,
+        range_x=[0.60, 0.95],
+    )
+    fig_bench.update_traces(texttemplate="%{text:.4f}", textposition="outside")
+    fig_bench.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                            margin=dict(l=10, r=40, t=30, b=20))
+    st.plotly_chart(fig_bench, width="stretch")
+    comment("Le **stacking final (E11)** atteint **F1 = 0.896**, à **−1.8 pt** de la 1ʳᵉ place SIGIR 2020 "
+            "(0.9144) et **+6.4 pts** au-dessus de la baseline TF-IDF + LightGBM (0.8321).")
 
-    with st.expander("🔧 Statut du pipeline", expanded=False):
-        for name, ok in artifact_status.items():
-            if ok is True:
-                st.markdown(f'<span class="badge-ok">✓ {name}</span>', unsafe_allow_html=True)
-            elif ok == 'baseline_fallback':
-                st.markdown(f'<span class="badge-warn">⚠ {name} (fallback baseline)</span>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<span class="badge-err">✗ {name} — manquant</span>', unsafe_allow_html=True)
+    # ── §1 Baseline TF-IDF + LightGBM ────────────────────────────────────
+    st.markdown('<div class="section-title">§1 · Baseline multimodale — TF-IDF + LightGBM</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        "Représentation **TF-IDF** (50 000 features, bigrammes, `sublinear_tf`) + features image légères "
+        "(histogramme RGB 8 bins) + meta-features Etape 1 → **LightGBM** (`class_weight=balanced`). "
+        "Résultat : **F1 = 0.8262 (val) / 0.8321 (test)**."
+    )
+    show_fig("baseline_confusion_matrix.png",
+             "Figure 1 — Matrice de confusion baseline (test, 12 738 produits)")
+    show_fig("baseline_f1_per_class.png",
+             "Figure 2 — F1-score par classe : 5 classes < 0.75 (1281, 10, 1180, 2403, 1280)")
+    show_fig("baseline_tfidf_importance.png",
+             "Figure 3 — Top features TF-IDF (gain LightGBM) — tokens métier intelligibles")
+    comment("Trois facteurs structurels expliquent l'erreur résiduelle : **frontière sémantique floue** "
+            "entre classes voisines (jeux/figurines, livres/magazines), **35,1 %** de descriptions manquantes "
+            "(χ² = 2 847, p < 0.001), et stemming FR pénalisant les **15,8 %** de produits non-FR.")
+
+    # ── §2 Branche texte deep ────────────────────────────────────────────
+    st.markdown('<div class="section-title">§2 · Approfondissement de la branche texte</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        "Benchmark de **4 configurations** texte (TF-IDF brut, TF-IDF + c-TF-IDF, **multilingual-e5-large**, "
+        "**CamemBERT fine-tuné**) en protocole **OOF (Out-Of-Fold)** stratifié 5-folds."
+    )
+    show_fig("texte_benchmark.png",
+             "Figure 5 — Benchmark des 4 configurations texte (weighted F1)")
+    show_fig("ctfidf_similarity_heatmap.png",
+             "Figure 4 — Heatmap c-TF-IDF : similarités cosinus entre 27 centroïdes de classe")
+    show_fig("texte_logreg_coefficients.png",
+             "Figure 6 — Top coefficients LogReg surrogate sur embeddings e5-large")
+    comment("**CamemBERT** (F1 = 0.876) bat e5-large (0.863), lui-même supérieur à TF-IDF + c-TF-IDF (0.848). "
+            "Spécialisation FR + token-level contextualisation > généralité multilingue sur un corpus à 84 % français.")
+
+    # ── §3 Branche image ─────────────────────────────────────────────────
+    st.markdown('<div class="section-title">§3 · Approfondissement de la branche image</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        "Trois familles d'architectures comparées : **DINOv2-base** (frozen feature extractor), "
+        "**CLIP ViT-B/32** (frozen & fine-tuned), **ResNet50** (fine-tuning progressif 3 phases)."
+    )
+    col_img1, col_img2, col_img3 = st.columns(3)
+    with col_img1: show_fig("viz_resnet50.png",   "ResNet50 — fine-tuning progressif")
+    with col_img2: show_fig("viz_clip_ft.png",    "CLIP ViT-B/32 — fine-tuned")
+    with col_img3: show_fig("viz_dino_ft.png",    "DINOv2-base — frozen + linear probe")
+    comment("CLIP fine-tuné atteint **F1 = 0.677** seul. La modalité image plafonne sur les classes "
+            "**visuellement isomorphes** (livres / magazines / BD) et apporte ~12 % de gain en stacking.")
+
+    # ── §4 Stacking multimodal final ─────────────────────────────────────
+    st.markdown('<div class="section-title">§4 · Stacking multimodal — meta-classifieur</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        "**Meta-MLP** agrège les probabilités OOF de CamemBERT (texte) + CLIP-FT (image) + **6 meta-scalaires** "
+        "(entropie, marge, max_conf par modalité) + features de preprocessing Etape 1. "
+        "Progression sur 12 variantes **E0 → E11**, **F1 final = 0.896 (test)**."
+    )
+    show_fig("meta_features_distribution.png",
+             "Figure 9 — Distribution des 6 meta-scalaires (entropie / marge / max_conf, texte vs image)")
+    col_s1, col_s2 = st.columns(2)
+    with col_s1: show_fig("stacking_confusion_matrix.png", "Matrice de confusion — stacking final E11")
+    with col_s2: show_fig("stacking_f1_per_class.png",     "F1 par classe — stacking final")
+    show_fig("stacking_confidence_analysis.png",
+             "Analyse de la confiance : entropie vs justesse (calibration du meta-classifieur)")
+    show_fig("benchmark_final_vs_sigir2020.png",
+             "Benchmark : notre stacking vs top 5 SIGIR 2020 (1ʳᵉ place 0.9144)")
+    comment("Le **stacking E11** corrige **+2 pts** sur les classes textuellement ambiguës "
+            "(jeux 1180/1281, livres 10/2403) grâce à la complémentarité du signal image.")
+
+    # ── §5 Interprétabilité ──────────────────────────────────────────────
+    st.markdown('<div class="section-title">§5 · Interprétabilité</div>', unsafe_allow_html=True)
+    st.markdown("**Branche texte** : permutation importance + top mots discriminants. "
+                "**Branche image** : Grad-CAM sur les CNN fine-tunés.")
+    show_fig("graph05b_top_words_per_class.png",
+             "Figure 14 — Top mots discriminants par classe (régularités lexicales légitimes)")
+    col_g1, col_g2 = st.columns(2)
+    with col_g1: show_fig("gradcam_best_model.png", "Grad-CAM — meilleur modèle image")
+    with col_g2: show_fig("gradcam_resnet50.png",   "Grad-CAM — ResNet50 (couche conv finale)")
+    comment("Grad-CAM confirme que le réseau **attend les bons endroits** : packaging produit pour les jeux, "
+            "couverture pour les livres, silhouette produit pour le mobilier. Pas de focus parasite sur le fond.")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 4 — DÉMO INFÉRENCE
+# ═════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown('<div class="section-title">Tester un produit en direct</div>', unsafe_allow_html=True)
+    st.caption("CamemBERT fine-tuné pour le texte · CLIP+MLP pour l'image · "
+               "Stacker Logistic Regression par expert, fusionnés par moyenne.")
+
+    samples = load_sample_designations(n=6)
+    sample_labels = ["✏️ Saisie manuelle"] + [
+        f"#{i+1} — {s['true_name']} ({str(s['designation'])[:60]}…)"
+        for i, s in enumerate(samples)
+    ]
+    choice = st.selectbox("Exemple :", sample_labels, index=0)
+
+    if choice != sample_labels[0]:
+        idx = sample_labels.index(choice) - 1
+        default_des = samples[idx]["designation"]
+        default_desc = samples[idx]["description"]
+        true_label = f"{samples[idx]['true_code']} — {samples[idx]['true_name']}"
+    else:
+        default_des = ""
+        default_desc = ""
+        true_label = None
+
+    col_form, col_img = st.columns([2, 1])
+    with col_form:
+        designation = st.text_input("Désignation (titre)", value=default_des, key="des_input")
+        description = st.text_area("Description", value=default_desc, height=140, key="desc_input")
+    with col_img:
+        st.markdown("**Image produit (optionnelle)**")
+        uploaded = st.file_uploader("Charger une image", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
+        pil_image = None
+        if uploaded is not None:
+            pil_image = Image.open(BytesIO(uploaded.read()))
+            st.image(pil_image, width="stretch")
+
+    predict = st.button("🔮 Prédire", type="primary", width="stretch")
+
+    if predict:
+        if not designation and not description and pil_image is None:
+            st.warning("Saisissez au moins une désignation, une description, ou chargez une image.")
+        else:
+            if true_label:
+                st.info(f"**Vraie classe :** {true_label}")
+
+            with st.spinner("Inférence CamemBERT + CLIP en cours…"):
+                # Text branch ─────────────────────────────────────────────
+                text_probs = predict_text_probs(designation, description)
+                if text_probs is not None:
+                    text_stacked = META_TEXT.predict_proba(text_probs.reshape(1, -1))[0]
+                    pred_text = stack_top3(text_stacked, LE)
+                else:
+                    pred_text = []
+
+                # Image branch ────────────────────────────────────────────
+                if pil_image is not None:
+                    image_probs = predict_image_probs(pil_image)
+                    image_stacked = META_IMAGE.predict_proba(image_probs.reshape(1, -1))[0]
+                    pred_image = stack_top3(image_stacked, LE)
+                else:
+                    image_stacked = None
+                    pred_image = []
+
+                # Fusion ──────────────────────────────────────────────────
+                if text_probs is not None and image_stacked is not None:
+                    combined = (text_stacked + image_stacked) / 2.0
+                    pred_combined = stack_top3(combined, LE)
+                else:
+                    combined = None
+                    pred_combined = []
+
+            c1, c2, c3 = st.columns(3)
+
+            def render_pred(col, title, preds, primary=False, hint: str = ""):
+                with col:
+                    cls = "pred-card" if primary else "pred-card-secondary"
+                    cls2 = "" if primary else "pred-class-secondary"
+                    if not preds:
+                        st.markdown(f'<div class="{cls}">'
+                                    f'<div class="pred-model">{title}</div>'
+                                    f'<div class="pred-class {cls2}">—</div>'
+                                    f'<div class="pred-conf">{hint or "Pas d\'entrée exploitable"}</div>'
+                                    f'</div>', unsafe_allow_html=True)
+                        return
+                    top1 = preds[0]
+                    rest = "<br>".join(
+                        f'<span style="color:#6c757d;">{n}: <b>{p:.1%}</b></span>'
+                        for _, n, p in preds[1:]
+                    )
+                    st.markdown(
+                        f'<div class="{cls}">'
+                        f'<div class="pred-model">{title}</div>'
+                        f'<div class="pred-class {cls2}">{top1[1]}</div>'
+                        f'<div class="pred-conf">Code <b>{top1[0]}</b> · Confiance <b>{top1[2]:.1%}</b></div>'
+                        f'<hr style="margin:0.6rem 0;border:0;border-top:1px solid #e0e0e0;">'
+                        f'<div style="font-size:0.85rem;">{rest}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            render_pred(c1, "Texte — CamemBERT + Meta-E1", pred_text,
+                        hint="📝 Saisissez un texte pour activer ce modèle")
+            render_pred(c2, "Image — CLIP+MLP + Meta-E2", pred_image,
+                        hint="📷 Chargez une image pour activer ce modèle")
+            render_pred(c3, "Fusion — Stacking E1 + E2", pred_combined, primary=True,
+                        hint="🔗 Texte ET image requis pour la fusion")
+
+            # ── Top-3 probabilities (best available model) ──────────────
+            best_preds = pred_combined or pred_text or pred_image
+            if best_preds:
+                df_preds = pd.DataFrame(best_preds, columns=["code", "Classe", "Probabilité"])
+                fig_p = px.bar(
+                    df_preds, x="Probabilité", y="Classe", orientation="h",
+                    color="Probabilité", color_continuous_scale="Reds",
+                    template="plotly_white", height=240,
+                    range_x=[0, 1], text="Probabilité",
+                )
+                fig_p.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+                fig_p.update_coloraxes(showscale=False)
+                fig_p.update_layout(yaxis={"categoryorder": "total ascending"},
+                                    margin=dict(l=10, r=50, t=20, b=20))
+                st.plotly_chart(fig_p, width="stretch")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 5 — MÉTHODOLOGIE
+# ═════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown('<div class="section-title">Pipeline v2 (architecture déployée)</div>', unsafe_allow_html=True)
+    st.code(
+        """
+                ┌─────────────────────────┐
+designation ───►│   Light cleaning        │
+description ───►│   (HTML, lower)         │
+                └────────────┬────────────┘
+                             ▼
+                ┌────────────────────────┐
+                │  CamemBERT tokenizer   │
+                │  (SentencePiece, 32 K) │
+                └────────────┬───────────┘
+                             ▼
+                ┌────────────────────────┐
+                │ CamemBERT fine-tuné    │     27 probs texte
+                │ (12 layers, 768 dim)   │─────────┐
+                └────────────────────────┘         │
+                                                   ▼
+                                          ┌──────────────────┐
+                                          │  Meta-LR  E1     │  text_stacked (27)
+                                          │  (27 → 27)       │─────────────────┐
+                                          └──────────────────┘                 │
+image ───► CLIP preprocess (224×224) ───┐                                      │
+                                        ▼                                      │
+                              ┌─────────────────────┐                          │
+                              │  CLIP ViT-B/32      │  512-d  L2-normalized    │
+                              │  (laion2b, frozen)  │                          │
+                              └──────────┬──────────┘                          │
+                                         ▼                                     │
+                              ┌─────────────────────┐                          │
+                              │  MLP 512→512→256→27 │  27 probs image          │
+                              │  (BN + GELU + Drop) │─────────┐                │
+                              └─────────────────────┘         │                │
+                                                              ▼                │
+                                                     ┌──────────────────┐     │
+                                                     │  Meta-LR  E2     │  image_stacked (27)
+                                                     │  (27 → 27)       │─────┤
+                                                     └──────────────────┘     │
+                                                                              ▼
+                                                                       ┌─────────────┐
+                                                                       │   Average   │
+                                                                       │ (E1 + E2)/2 │
+                                                                       └──────┬──────┘
+                                                                              ▼
+                                                                      27 prdtypecode probas
+        """,
+        language=None,
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="section-title">Choix techniques</div>', unsafe_allow_html=True)
+        st.markdown("""
+- **CamemBERT-base** (110 M params) fine-tuné 3 epochs, batch 32, lr 2e-5
+- **CLIP ViT-B/32 (laion2B)** : backbone gelé, MLP entraîné from scratch
+- **MLP image** : 3 couches denses avec BatchNorm + GELU + Dropout 0.3
+- **Meta-stacker** : Logistic Regression `saga`, `class_weight=balanced`, C=2.0
+- **Fusion par moyenne** plutôt que stacking de niveau 2 : plus robuste avec peu de données
+- **Pas de TTA / d'augmentation** : focus sur la qualité du backbone
+        """)
+    with col2:
+        st.markdown('<div class="section-title">Limites identifiées</div>', unsafe_allow_html=True)
+        st.markdown("""
+- **CamemBERT 512 tokens max** : descriptions très longues tronquées (~3% du corpus)
+- **CLIP en zéro-shot visuel** : embeddings non spécialisés sur l'iconographie produit Rakuten
+- **Stackers par modalité indépendants** : pas de co-attention texte↔image au niveau features
+- **Pas de calibration de température** post-hoc (Platt scaling pourrait gagner 0.5 pt)
+- **Classes 1280 / 1281** restent confondues : signal sémantique trop proche
+        """)
+
+    st.markdown('<div class="section-title">Perspectives</div>', unsafe_allow_html=True)
+    persp = pd.DataFrame([
+        {"Idée": "DINOv2 frozen + linear head",      "Gain attendu": "+1 à 2 pts", "Coût": "Inférence légère"},
+        {"Idée": "Fine-tuning CLIP visuel partiel",  "Gain attendu": "+2 à 4 pts", "Coût": "GPU recommandé"},
+        {"Idée": "Stacker MLP (niveau 2, 61→27)",    "Gain attendu": "+0.5 à 1 pt","Coût": "Aucun (artefact dispo)"},
+        {"Idée": "GPT-4o fine-tuning multimodal",    "Gain attendu": "+3 à 5 pts", "Coût": "API payante"},
+        {"Idée": "Augmentation image + TTA",         "Gain attendu": "+0.5 à 1 pt","Coût": "Re-training"},
+    ])
+    st.dataframe(persp, width="stretch", hide_index=True)
+
+    st.markdown('<div class="section-title">Livrables</div>', unsafe_allow_html=True)
+    st.markdown("""
+- 📓 **5 notebooks** : `EDA.ipynb`, `modeling.ipynb`, `rakuten.ipynb`, `compare_tfidf.ipynb`, `check.ipynb`
+- 🐍 **Scripts modèles** : baseline · TF-IDF traduit · OpenCV · CLIP+MLP · GPT-4o
+- 🤖 **Artefacts v2** (`models/v2/`) :
+    - `camembert_ft_best.pth` — CamemBERT fine-tuné (442 MB)
+    - `clip_mlp_best.pth` — Tête image CLIP+MLP (1.6 MB)
+    - `meta_E1.pkl`, `meta_E2.pkl` — Stackers Logistic Regression
+    - `label_encoder.pkl`, `ctfidf_centroids.npy` — Outils de support
+- 📊 **17 figures** EDA + modélisation
+- 🎯 **Cette démo** Streamlit (CamemBERT + CLIP + stacking, sans ré-entraînement)
+    """)
 
     st.markdown("---")
-
-    # --- Formulaire ---
-    col_form, col_result = st.columns([1, 1], gap="large")
-
-    with col_form:
-        st.markdown('<div class="section-title">📝 Saisir les informations produit</div>', unsafe_allow_html=True)
-
-        designation = st.text_input(
-            "Désignation (titre du produit) *",
-            placeholder="Ex: LEGO Star Wars Millennium Falcon 75192",
-            help="Titre principal du produit tel qu'il apparaît sur la plateforme.",
-        )
-
-        description = st.text_area(
-            "Description (optionnel)",
-            placeholder="Ex: Set de construction Lego. Contient 7541 pièces. Pour adultes et enfants 16+...",
-            height=140,
-            help="Description détaillée du produit. Peut être vide.",
-        )
-
-        uploaded_image = st.file_uploader(
-            "Image du produit (optionnel)",
-            type=['jpg', 'jpeg', 'png', 'webp'],
-            help="Image du produit. Si fournie, améliore la précision de la classification.",
-        )
-
-        if uploaded_image is not None:
-            from PIL import Image as PILImage
-            preview_img = PILImage.open(BytesIO(uploaded_image.read()))
-            uploaded_image.seek(0)
-            st.image(preview_img.resize((200, 200)), caption="Aperçu", width=200)
-        else:
-            preview_img = None
-
-        st.markdown("")
-        col_btn1, col_btn2 = st.columns([2, 1])
-        with col_btn1:
-            predict_btn = st.button(
-                "🔮 Classifier ce produit",
-                type="primary",
-                use_container_width=True,
-                disabled=not designation.strip(),
-            )
-        with col_btn2:
-            if st.button("🎲 Exemple aléatoire", use_container_width=True):
-                # Charger un produit aléatoire depuis le jeu de test
-                train_path = SPLIT_DIR / 'val.csv'
-                if train_path.exists():
-                    sample_df = pd.read_csv(train_path, nrows=500)
-                    rand_row = sample_df.sample(1).iloc[0]
-                    raw_col = 'text_combined_raw' if 'text_combined_raw' in sample_df.columns else 'text_combined'
-                    raw_text = str(rand_row.get(raw_col, ''))
-                    # Découpage approximatif designation/description
-                    parts = raw_text.split('. ', 1)
-                    st.session_state['demo_desig'] = parts[0][:120]
-                    st.session_state['demo_desc'] = parts[1][:200] if len(parts) > 1 else ''
-                    st.rerun()
-
-    # Auto-remplir depuis session_state (bouton exemple)
-    if 'demo_desig' in st.session_state:
-        designation = st.session_state.pop('demo_desig')
-        description = st.session_state.pop('demo_desc', '')
-
-    # --- Résultat ---
-    with col_result:
-        st.markdown('<div class="section-title">🎯 Résultat de la classification</div>', unsafe_allow_html=True)
-
-        if predict_btn and designation.strip():
-            if not any(artifact_status.values()):
-                st.error("Aucun modèle disponible. Veuillez d'abord exécuter les notebooks 1 à 5.")
-            else:
-                with st.spinner("Analyse en cours..."):
-                    t0 = time.perf_counter()
-
-                    # Charger l'image si fournie
-                    pil_image = None
-                    if uploaded_image is not None:
-                        from PIL import Image as PILImage
-                        pil_image = PILImage.open(BytesIO(uploaded_image.read())).convert('RGB')
-
-                    try:
-                        result = pipe.predict(
-                            designation=designation,
-                            description=description,
-                            image=pil_image,
-                            use_deep_text=True,
-                            use_deep_image=(pil_image is not None),
-                        )
-                        elapsed = time.perf_counter() - t0
-
-                        # Stocker pour Tab 4
-                        st.session_state['last_result'] = result
-                        st.session_state['last_designation'] = designation
-                        st.session_state['last_description'] = description
-                        st.session_state['last_image'] = pil_image
-
-                        # Carte résultat
-                        st.markdown(f"""
-                        <div class="pred-card">
-                            <div style="font-size: 3rem;">
-                                {"📦" if result['confidence'] > 0.8 else "🤔"}
-                            </div>
-                            <div class="pred-class">{result['predicted_name']}</div>
-                            <div class="pred-conf">Code Rakuten : {result['predicted_code']}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                        st.markdown("")
-
-                        # Jauge de confiance
-                        conf = result['confidence']
-                        conf_color = '#2ecc71' if conf > 0.8 else '#f39c12' if conf > 0.5 else '#e74c3c'
-                        st.markdown(f"**Confiance : {conf*100:.1f}%**")
-                        st.progress(conf)
-
-                        # Top-3 classes
-                        st.markdown("**Top-3 classes probables :**")
-                        import plotly.graph_objects as go
-                        top3_names = [t[0] for t in result['top3']]
-                        top3_probs = [t[1] for t in result['top3']]
-                        colors_top3 = [conf_color if i == 0 else '#95a5a6' for i in range(3)]
-
-                        fig_top3 = go.Figure(go.Bar(
-                            y=top3_names[::-1], x=top3_probs[::-1],
-                            orientation='h',
-                            marker_color=colors_top3[::-1],
-                            text=[f'{p*100:.1f}%' for p in top3_probs[::-1]],
-                            textposition='outside',
-                        ))
-                        fig_top3.update_layout(
-                            xaxis=dict(range=[0, 1], tickformat='.0%'),
-                            margin=dict(l=10, r=80, t=10, b=10),
-                            height=160, template='plotly_white',
-                        )
-                        st.plotly_chart(fig_top3, use_container_width=True)
-
-                        # Meta-info
-                        st.caption(f"⏱ Temps d'inférence : {elapsed*1000:.0f} ms  |  Features : {', '.join(result['features_used'])}")
-
-                    except Exception as exc:
-                        st.error(f"Erreur lors de la prédiction : {exc}")
-                        st.info("Vérifiez que les notebooks 1-5 ont été exécutés et que les artefacts sont en place.")
-
-        elif not predict_btn:
-            st.markdown("""
-            <div style="text-align: center; padding: 3rem 1rem; color: #6c757d;">
-                <div style="font-size: 4rem;">🔮</div>
-                <p style="margin-top: 1rem;">Remplissez le formulaire et cliquez sur <strong>Classifier ce produit</strong></p>
-                <p style="font-size: 0.85rem;">Le modèle analysera le texte et l'image pour prédire la catégorie.</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-# ===========================================================================
-# TAB 4 — INTERPRÉTABILITÉ
-# ===========================================================================
-
-with tab4:
-    st.markdown('<div class="section-title">Comment le modèle prend sa décision ?</div>', unsafe_allow_html=True)
-
-    last_result = st.session_state.get('last_result')
-    last_desig  = st.session_state.get('last_designation', '')
-    last_desc   = st.session_state.get('last_description', '')
-    last_image  = st.session_state.get('last_image')
-
-    if last_result is None:
-        st.info("💡 Effectuez une prédiction dans l'onglet **Inférence Multimodale** pour voir l'interprétabilité.")
-        st.markdown("---")
-        st.markdown("**Ce que vous verrez ici :**")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("""
-            **📝 Interprétabilité Texte**
-            - Mots qui ont le plus influencé la décision
-            - Coefficient LogReg positif (favorable à la classe)
-            - Coefficient LogReg négatif (défavorable)
-            - Visualisation avec barres colorées
-            """)
-        with col_b:
-            st.markdown("""
-            **🖼️ Interprétabilité Image (GradCAM)**
-            - Zones de l'image les plus discriminantes
-            - Heatmap de chaleur superposée
-            - Calculé via ResNet50 fine-tuné
-            - Explique "où le modèle regarde"
-            """)
-    else:
-        pipe_interp = get_pipeline()
-        predicted_idx  = last_result['predicted_idx']
-        predicted_name = last_result['predicted_name']
-        confidence     = last_result['confidence']
-
-        # --- En-tête résultat ---
-        st.success(f"Analyse de la prédiction : **{predicted_name}** (confiance {confidence*100:.1f}%)")
-
-        col_text, col_img = st.columns(2, gap="large")
-
-        # ── Texte ──────────────────────────────────────────────────────────
-        with col_text:
-            st.markdown('<div class="section-title">📝 Interprétabilité Texte</div>', unsafe_allow_html=True)
-
-            word_scores = pipe_interp.highlight_important_words(
-                text=last_desig + ' ' + last_desc,
-                predicted_class_idx=predicted_idx,
-                top_n=15,
-            )
-
-            if word_scores:
-                import plotly.graph_objects as go
-                words = [w for w, _ in word_scores]
-                scores = [s for _, s in word_scores]
-                colors = ['#2ecc71' if s > 0 else '#e74c3c' for s in scores]
-
-                fig_words = go.Figure(go.Bar(
-                    x=scores, y=words, orientation='h',
-                    marker_color=colors,
-                    text=[f'{s:+.3f}' for s in scores],
-                    textposition='outside',
-                ))
-                fig_words.update_layout(
-                    xaxis_title='Coefficient LogReg',
-                    yaxis_title='',
-                    template='plotly_white',
-                    height=400,
-                    margin=dict(l=10, r=60, t=20, b=20),
-                )
-                fig_words.add_vline(x=0, line_color='black', line_width=1)
-                st.plotly_chart(fig_words, use_container_width=True)
-
-                # Texte annoté
-                st.markdown("**Texte analysé avec importance des mots :**")
-                full_text = (last_desig + ' ' + last_desc).strip()
-                score_map = {w: s for w, s in word_scores}
-
-                from pipeline import preprocess_text, build_combined_raw
-                tokens_clean = preprocess_text(build_combined_raw(last_desig, last_desc)).split()
-                raw_tokens = full_text.split()
-
-                highlighted_parts = []
-                for tok in raw_tokens[:80]:
-                    clean_tok = preprocess_text(tok)
-                    if clean_tok in score_map:
-                        s = score_map[clean_tok]
-                        if s > 0.05:
-                            highlighted_parts.append(f'<mark style="background:#d4edda;border-radius:3px;padding:1px 3px"><b>{tok}</b></mark>')
-                        elif s < -0.05:
-                            highlighted_parts.append(f'<mark style="background:#f8d7da;border-radius:3px;padding:1px 3px">{tok}</mark>')
-                        else:
-                            highlighted_parts.append(tok)
-                    else:
-                        highlighted_parts.append(tok)
-
-                html_text = ' '.join(highlighted_parts)
-                if len(raw_tokens) > 80:
-                    html_text += ' <em>(...)</em>'
-
-                st.markdown(
-                    f'<div style="background:#f8f9fa;padding:1rem;border-radius:8px;'
-                    f'border:1px solid #dee2e6;font-size:0.9rem;line-height:1.8">'
-                    f'{html_text}</div>',
-                    unsafe_allow_html=True
-                )
-                st.caption(
-                    '<span style="background:#d4edda;padding:2px 6px;border-radius:3px">Vert</span> = favorable &nbsp;'
-                    '<span style="background:#f8d7da;padding:2px 6px;border-radius:3px">Rouge</span> = défavorable',
-                    unsafe_allow_html=True
-                )
-            else:
-                st.info("Exécutez le **Notebook 3** pour générer `clf_text_full.pkl`.")
-
-        # ── Image ──────────────────────────────────────────────────────────
-        with col_img:
-            st.markdown('<div class="section-title">🖼️ Interprétabilité Image (GradCAM)</div>', unsafe_allow_html=True)
-
-            if last_image is not None:
-                with st.spinner("Calcul GradCAM..."):
-                    cam = pipe_interp.gradcam(last_image, predicted_idx)
-
-                if cam is not None:
-                    try:
-                        import cv2 as _cv2
-                    except ImportError:
-                        _cv2 = None
-                    import plotly.graph_objects as go
-                    from PIL import Image as PILImage
-
-                    img_resized = last_image.resize((224, 224))
-                    img_arr = np.array(img_resized)
-
-                    if _cv2 is not None:
-                        cam_resized = _cv2.resize(cam, (224, 224))
-                        heatmap_raw = _cv2.applyColorMap((cam_resized * 255).astype(np.uint8), _cv2.COLORMAP_JET)
-                        heatmap_rgb = _cv2.cvtColor(heatmap_raw, _cv2.COLOR_BGR2RGB)
-                    else:
-                        # Fallback sans cv2 : colormap matplotlib
-                        import matplotlib.cm as mpl_cm
-                        from PIL import Image as PILImage
-                        cam_resized_pil = np.array(PILImage.fromarray(
-                            (cam * 255).astype(np.uint8)).resize((224, 224))) / 255.0
-                        cmap = mpl_cm.get_cmap('jet')
-                        heatmap_rgb = (cmap(cam_resized_pil)[:, :, :3] * 255).astype(np.uint8)
-                        cam_resized = cam_resized_pil
-                    overlay = (0.55 * img_arr + 0.45 * heatmap_rgb).clip(0, 255).astype(np.uint8)
-
-                    col_i1, col_i2, col_i3 = st.columns(3)
-                    with col_i1:
-                        st.image(img_resized, caption="Image originale", use_column_width=True)
-                    with col_i2:
-                        st.image(heatmap_rgb, caption="Zones d'attention", use_column_width=True)
-                    with col_i3:
-                        st.image(overlay, caption="Superposition", use_column_width=True)
-
-                    # Statistiques de la heatmap
-                    st.markdown("**Analyse des zones d'attention :**")
-                    h, w = cam_resized.shape
-                    center_cam = cam_resized[h//4:3*h//4, w//4:3*w//4].mean()
-                    border_cam = (cam_resized.mean() * cam_resized.size - cam_resized[h//4:3*h//4, w//4:3*w//4].sum()) / \
-                                  (cam_resized.size - (h//2) * (w//2))
-                    focus = "centre" if center_cam > border_cam else "bords"
-                    st.markdown(f"→ Le modèle se concentre principalement sur le **{focus}** de l'image.")
-                    st.markdown(f"→ Attention maximale : {cam.max():.2f} | Attention moyenne : {cam.mean():.2f}")
-                else:
-                    st.warning("GradCAM non disponible. Vérifiez que `resnet50_ft.pth` existe dans `models/clean/`.")
-            else:
-                st.info("Soumettez une image dans l'onglet **Inférence** pour voir la carte GradCAM.")
-
-        # --- Explication vulgarisée ---
-        st.markdown("---")
-        st.markdown('<div class="section-title">🎓 Comment le modèle décide-t-il ?</div>', unsafe_allow_html=True)
-
-        col_v1, col_v2, col_v3 = st.columns(3)
-        with col_v1:
-            st.markdown("""
-            **Étape 1 — Analyse Texte**
-
-            Le modèle transforme le titre et la description en vecteur numérique.
-            Il compare ce vecteur avec les "profils textuels" de chaque catégorie
-            (c-TF-IDF) et avec 1024 dimensions sémantiques (e5-large).
-            """)
-        with col_v2:
-            st.markdown("""
-            **Étape 2 — Analyse Image**
-
-            DINOv2 (pré-entraîné sur 142M d'images) extrait 768 caractéristiques
-            visuelles. Pas besoin de fine-tuning : le modèle "voit" déjà très bien
-            les produits e-commerce.
-            """)
-        with col_v3:
-            st.markdown("""
-            **Étape 3 — Fusion (Stacking)**
-
-            Un méta-classifieur combine les probabilités des deux branches.
-            Il exploite aussi des méta-features : l'incertitude (entropie), la
-            marge entre les top-2 classes, et l'accord texte/image.
-            """)
-
-# ---------------------------------------------------------------------------
-# Footer
-# ---------------------------------------------------------------------------
-
-st.markdown("---")
-st.markdown(
-    '<p style="text-align:center;color:#6c757d;font-size:0.8rem;">'
-    'Rakuten Classification Multimodale — Challenge SIGIR eCommerce 2020 · '
-    'Xavier · Tingfen · Veyss'
-    '</p>',
-    unsafe_allow_html=True
-)
+    st.caption("DataScientest · Sprint 2 · Promo nov-2025 — DS Alternance MLE Rakuten")
